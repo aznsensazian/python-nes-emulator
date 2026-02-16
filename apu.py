@@ -300,7 +300,7 @@ class PulseChannel:
             return 0
         if self.duty_sequences[self.duty_cycle][self.sequence_pos] == 0:
             return 0
-        return self.envelope_volume if self.constant_volume else self.volume
+        return self.volume if self.constant_volume else self.envelope_volume
 
 
 class TriangleChannel:
@@ -427,7 +427,7 @@ class NoiseChannel:
             return 0
         if self.shift_register & 1:
             return 0
-        return self.envelope_volume if self.constant_volume else self.volume
+        return self.volume if self.constant_volume else self.envelope_volume
 
 
 class DMCChannel:
