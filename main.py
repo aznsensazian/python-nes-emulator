@@ -75,6 +75,13 @@ class AudioStreamer:
             return
         arr = np.array(self.buffer[:self.chunk_size], dtype=np.int16)
         self.buffer = self.buffer[self.chunk_size:]
+        
+        # Get mixer config to handle mono/stereo properly
+        mixer_info = pygame.mixer.get_init()
+        if mixer_info and mixer_info[2] == 2:  # Stereo
+            # Convert mono to stereo by duplicating the channel
+            arr = np.column_stack((arr, arr))
+        
         sound = pygame.sndarray.make_sound(arr)
         if self.channel and not self.channel.get_queue():
             self.channel.queue(sound)
@@ -134,10 +141,14 @@ class Emulator:
                 elif event.key == pygame.K_F1:
                     self.show_fps = not self.show_fps
                 elif event.key in KEY_MAP:
-                    self.nes.controller1.set_button(KEY_MAP[event.key], True)
+                    button = KEY_MAP[event.key]
+                    self.nes.controller1.set_button(button, True)
+                    if self.show_fps:  # Debug mode
+                        print(f"Button pressed: {button}")
             elif event.type == pygame.KEYUP:
                 if event.key in KEY_MAP:
-                    self.nes.controller1.set_button(KEY_MAP[event.key], False)
+                    button = KEY_MAP[event.key]
+                    self.nes.controller1.set_button(button, False)
 
     def render(self):
         frame = self.nes.get_frame()
