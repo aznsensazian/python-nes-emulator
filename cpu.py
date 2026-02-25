@@ -105,8 +105,8 @@ class CPU:
     def set_zn(self, value):
         """Set Zero and Negative flags based on value"""
         value &= 0xFF
-        self.set_flag(self.FLAG_Z, value == 0)
-        self.set_flag(self.FLAG_N, value & 0x80)
+        # Inline flag setting: clear Z and N, then set as needed
+        self.P = (self.P & 0x7D) | (0x02 if value == 0 else 0) | (value & 0x80)
     
     # Addressing modes
     def addr_implied(self):
@@ -1003,25 +1003,27 @@ class CPU:
         if self.nmi_pending:
             self.nmi()
             self.nmi_pending = False
-        elif self.irq_pending and not self.get_flag(self.FLAG_I):
+        elif self.irq_pending and not (self.P & 0x04):
             self.irq()
             self.irq_pending = False
-        
-        opcode = self.read(self.PC)
+
+        opcode = self.memory.read(self.PC)
         self.PC = (self.PC + 1) & 0xFFFF
-        
-        if self.opcodes[opcode] is None:
-            # Unimplemented opcode
-            print(f"Unimplemented opcode: ${opcode:02X} at ${self.PC-1:04X}")
+
+        entry = self.opcodes[opcode]
+        if entry is None:
+            self.cycles = 2
+            self.total_cycles += 2
             return 2
-        
-        instruction, addr_mode, cycles = self.opcodes[opcode]
+
+        instruction, addr_mode, cycles = entry
         addr, page_crossed = addr_mode()
         extra_cycles = instruction(addr, page_crossed)
-        
-        self.cycles = cycles + extra_cycles
-        self.total_cycles += self.cycles
-        return self.cycles
+
+        cycles += extra_cycles
+        self.cycles = cycles
+        self.total_cycles += cycles
+        return cycles
     
     def nmi(self):
         """Non-Maskable Interrupt"""

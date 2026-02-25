@@ -54,8 +54,16 @@ class Memory:
         # APU and I/O Registers (0x4000-0x4017)
         elif address < 0x4018:
             if address == 0x4014:
-                # OAMDMA - Sprite DMA
-                self.nes.ppu.write_register(address, value)
+                # OAM DMA - copy 256 bytes from CPU page to PPU OAM
+                page = value << 8
+                ppu = self.nes.ppu
+                oam = ppu.oam
+                oa = ppu.oam_addr
+                for i in range(256):
+                    oam[(oa + i) & 0xFF] = self.read(page + i)
+                # DMA takes 513 or 514 CPU cycles
+                cpu = self.nes.cpu
+                cpu.cycles += 513 + (cpu.total_cycles & 1)
             elif address == 0x4016:
                 self.nes.controller1.write(value)
                 self.nes.controller2.write(value)

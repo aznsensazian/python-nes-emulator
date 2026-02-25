@@ -143,8 +143,6 @@ class Emulator:
                 elif event.key in KEY_MAP:
                     button = KEY_MAP[event.key]
                     self.nes.controller1.set_button(button, True)
-                    if self.show_fps:  # Debug mode
-                        print(f"Button pressed: {button}")
             elif event.type == pygame.KEYUP:
                 if event.key in KEY_MAP:
                     button = KEY_MAP[event.key]
