@@ -143,20 +143,60 @@ class APU:
     
     def step(self):
         """Step APU by one CPU cycle"""
-        self.cycles += 1
-        
-        # Clock frame counter at ~240 Hz
-        if self.cycles % 7457 == 0:
+        self.clock(1)
+
+    def clock(self, cpu_cycles):
+        """Step APU by multiple CPU cycles at once (performance optimization)."""
+        old_cycles = self.cycles
+        self.cycles += cpu_cycles
+
+        # Check if any frame counter triggers crossed (every 7457 cycles)
+        old_frame = old_cycles // 7457
+        new_frame = self.cycles // 7457
+        for _ in range(new_frame - old_frame):
             self.clock_frame_counter()
-        
-        # Clock triangle's timer every CPU cycle
-        self.triangle.clock_timer()
-        
-        # Clock pulse and noise timers every other CPU cycle
-        if self.cycles % 2 == 0:
-            self.pulse1.clock_timer()
-            self.pulse2.clock_timer()
-            self.noise.clock_timer()
+
+        # Inline triangle timer clocking (runs every CPU cycle)
+        tri = self.triangle
+        remaining = cpu_cycles
+        while remaining > 0:
+            if tri.timer > 0:
+                ticks = min(remaining, tri.timer)
+                tri.timer -= ticks
+                remaining -= ticks
+            else:
+                tri.timer = tri.timer_period
+                if tri.length_counter > 0 and tri.linear_counter > 0:
+                    tri.sequence_pos = (tri.sequence_pos + 1) & 31
+                remaining -= 1
+
+        # Inline pulse and noise timer clocking (runs every other CPU cycle)
+        half_cycles = cpu_cycles >> 1
+        if half_cycles > 0:
+            for ch in (self.pulse1, self.pulse2):
+                rem = half_cycles
+                while rem > 0:
+                    if ch.timer > 0:
+                        ticks = min(rem, ch.timer)
+                        ch.timer -= ticks
+                        rem -= ticks
+                    else:
+                        ch.timer = ch.timer_period
+                        ch.sequence_pos = (ch.sequence_pos + 1) & 7
+                        rem -= 1
+
+            n = self.noise
+            rem = half_cycles
+            while rem > 0:
+                if n.timer > 0:
+                    ticks = min(rem, n.timer)
+                    n.timer -= ticks
+                    rem -= ticks
+                else:
+                    n.timer = n.timer_period
+                    feedback = (n.shift_register & 1) ^ ((n.shift_register >> (6 if n.mode else 1)) & 1)
+                    n.shift_register = (n.shift_register >> 1) | (feedback << 14)
+                    rem -= 1
     
     def clock_frame_counter(self):
         """Clock frame counter"""

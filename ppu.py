@@ -25,6 +25,12 @@ _NES_PALETTE = np.array([
     0x99,0xFF,0xFC, 0xDD,0xDD,0xDD, 0x11,0x11,0x11, 0x11,0x11,0x11,
 ], dtype=np.uint8).reshape(64, 3)
 
+# Pre-computed bitplane decode: for each byte, the 8 pixel bit values (MSB first)
+_BIT_DECODE = [None] * 256
+for _b in range(256):
+    _BIT_DECODE[_b] = ((_b >> 7) & 1, (_b >> 6) & 1, (_b >> 5) & 1, (_b >> 4) & 1,
+                        (_b >> 3) & 1, (_b >> 2) & 1, (_b >> 1) & 1, _b & 1)
+
 
 class PPU:
     def __init__(self, nes):
@@ -68,8 +74,15 @@ class PPU:
         self._mirror_mode = -1
         self._nt_map = [0, 0, 0, 0]  # base offsets into self.vram for each NT
 
-        # Tile-row cache: invalidated each scanline (cheap dict)
-        self._tile_cache = {}
+        # Pre-allocated scanline buffers (reused every scanline to avoid allocations)
+        self._bg_pixels = [0] * 256
+        self._sp_pixels = [0] * 256
+        self._sp_prio = [0] * 256
+        self._sp_opaque = [0] * 256
+        self._sp0_opaque = [0] * 256
+
+        # Pre-computed bit decode table: byte -> tuple of 8 bit values (bit7..bit0)
+        self._bit_decode = _BIT_DECODE
 
     # ----------------------------------------------------------------
     # Public API used by NES to advance the PPU
@@ -194,14 +207,6 @@ class PPU:
         elif reg == 7:  # PPUDATA
             self.write_vram(self.v, value)
             self.v = (self.v + (32 if self.ctrl & 4 else 1)) & 0x7FFF
-        elif address == 0x4014:  # OAM DMA
-            page = value << 8
-            cpu = self.nes.cpu
-            oam = self.oam
-            oa = self.oam_addr
-            for i in range(256):
-                oam[(oa + i) & 0xFF] = cpu.read(page + i)
-            cpu.cycles += 513 if (cpu.total_cycles & 1 == 0) else 514
 
     # ----------------------------------------------------------------
     # VRAM access helpers
@@ -274,57 +279,59 @@ class PPU:
         # Copy horizontal scroll bits from t to v at start of each visible scanline
         self.v = (self.v & ~0x041F) | (self.t & 0x041F)
 
-        # -- Background --
-        bg_pixels = self._render_bg_scanline(y, read_chr)
+        # -- Background (writes into self._bg_pixels) --
+        bg = self._bg_pixels
+        self._render_bg_scanline(y, read_chr)
 
-        # -- Sprites --
-        sprite_pixels, sprite_prio, sprite_opaque, sprite0_opaque = self._render_sprite_scanline(y, read_chr)
+        # -- Sprites (writes into self._sp_* buffers) --
+        sp_pixels = self._sp_pixels
+        sp_prio = self._sp_prio
+        sp_opaque = self._sp_opaque
+        sp0 = self._sp0_opaque
+        self._render_sprite_scanline(y, read_chr)
 
         # -- Sprite 0 hit detection --
         if not (self.status & 0x40):  # Not already set this frame
             if (self.mask & 0x18) == 0x18:  # Both bg and sprites enabled
                 both_left = (self.mask & 0x06) == 0x06
-                for px in range(255):  # x=255 doesn't trigger on real hardware
-                    if px < 8 and not both_left:
-                        continue
-                    if sprite0_opaque[px] and (bg_pixels[px] & 3):
+                start = 0 if both_left else 8
+                for px in range(start, 255):  # x=255 doesn't trigger
+                    if sp0[px] and (bg[px] & 3):
                         self.status |= 0x40
                         break
 
-        # -- Compose --
+        # -- Compose (hot loop - all locals for speed) --
         for px in range(256):
-            bg_val = bg_pixels[px]
-            sp_val = sprite_pixels[px]
-            sp_opq = sprite_opaque[px]
-
-            if sp_opq:
-                if (bg_val & 3) and sprite_prio[px]:
-                    # bg priority
+            bg_val = bg[px]
+            if sp_opaque[px]:
+                if (bg_val & 3) and sp_prio[px]:
                     color = bg_val
                 else:
-                    color = sp_val
+                    color = sp_pixels[px]
             else:
                 color = bg_val
-
             screen_row[px] = palette_rgb[palette_ram[color] & 0x3F]
 
         # Y increment at end of visible scanline
         self._y_increment()
 
     def _render_bg_scanline(self, y, read_chr):
-        """Return 256-element list of palette indices for background.
-        Uses v register for scroll position (proper NES PPU behavior)."""
-        bg = [0] * 256
+        """Render background into self._bg_pixels using v register for scroll."""
+        bg = self._bg_pixels
+        # Clear buffer
+        for i in range(256):
+            bg[i] = 0
+
         if not (self.mask & 0x08):
-            return bg
+            return
 
         # Extract scroll position from v register
         v = self.v
         coarse_x = v & 0x1F
         coarse_y = (v >> 5) & 0x1F
         fine_y = (v >> 12) & 0x7
-        nt_h = (v >> 10) & 1  # horizontal nametable bit
-        nt_v = (v >> 11) & 1  # vertical nametable bit
+        nt_h = (v >> 10) & 1
+        nt_v = (v >> 11) & 1
         fine_x = self.x
 
         pattern_table = 0x1000 if (self.ctrl & 0x10) else 0
@@ -332,6 +339,7 @@ class PPU:
 
         vram = self.vram
         mirror_nt = self.mirror_nametable
+        bit_decode = self._bit_decode
 
         px = 0
         tile_col = coarse_x
@@ -339,23 +347,22 @@ class PPU:
         first_tile = True
 
         while px < 256:
-            # Calculate nametable base address
             nt_index = cur_nt_h | (nt_v << 1)
             nt_base = 0x2000 + nt_index * 0x400
 
-            # Get tile index from nametable
             tile_idx = vram[mirror_nt(nt_base + coarse_y * 32 + tile_col)]
             pat_addr = pattern_table + tile_idx * 16 + fine_y
             lo = read_chr(pat_addr)
             hi = read_chr(pat_addr + 8)
 
-            # Get palette from attribute table
             attr_addr = nt_base + 0x3C0 + (coarse_y >> 2) * 8 + (tile_col >> 2)
             attr = vram[mirror_nt(attr_addr)]
             shift = ((coarse_y & 2) << 1) | (tile_col & 2)
             pal_base = ((attr >> shift) & 3) << 2
 
-            # Determine pixel range within this tile
+            lo_bits = bit_decode[lo]
+            hi_bits = bit_decode[hi]
+
             start = fine_x if first_tile else 0
             first_tile = False
 
@@ -363,19 +370,15 @@ class PPU:
                 if px >= 256:
                     break
                 if not (px < 8 and clip_left):
-                    bit = 7 - i
-                    pixel = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1)
+                    pixel = lo_bits[i] | (hi_bits[i] << 1)
                     if pixel:
                         bg[px] = pal_base + pixel
                 px += 1
 
-            # Advance to next tile column
             tile_col += 1
             if tile_col >= 32:
                 tile_col = 0
-                cur_nt_h ^= 1  # Switch horizontal nametable
-
-        return bg
+                cur_nt_h ^= 1
 
     def _y_increment(self):
         """Increment fine Y in v register, wrapping to coarse Y as needed."""
@@ -394,17 +397,25 @@ class PPU:
             self.v = (self.v & ~0x03E0) | (y << 5)
 
     def _render_sprite_scanline(self, y, read_chr):
-        """Return (pixels[256], priority[256], opaque[256], sprite0_opaque[256])."""
-        pixels = [0] * 256
-        prio = [False] * 256
-        opaque = [False] * 256
-        sprite0 = [False] * 256
+        """Render sprites into pre-allocated self._sp_* buffers."""
+        pixels = self._sp_pixels
+        prio = self._sp_prio
+        opaque = self._sp_opaque
+        sprite0 = self._sp0_opaque
+
+        # Clear buffers
+        for i in range(256):
+            pixels[i] = 0
+            prio[i] = 0
+            opaque[i] = 0
+            sprite0[i] = 0
 
         if not (self.mask & 0x10):
-            return pixels, prio, opaque, sprite0
+            return
 
         sprite_size = 16 if (self.ctrl & 0x20) else 8
         oam = self.oam
+        bit_decode = self._bit_decode
         count = 0
 
         for i in range(64):
@@ -444,26 +455,27 @@ class PPU:
 
             lo = read_chr(pat_addr)
             hi = read_chr(pat_addr + 8)
+            lo_bits = bit_decode[lo]
+            hi_bits = bit_decode[hi]
+            is_sprite0 = (i == 0)
 
             for bit in range(8):
                 px_x = sprite_x + bit
                 if px_x >= 256:
                     break
                 if opaque[px_x]:
-                    continue  # higher priority sprite already here
+                    continue
 
                 col = (7 - bit) if not flip_h else bit
-                pixel = ((lo >> col) & 1) | (((hi >> col) & 1) << 1)
+                pixel = lo_bits[col] | (hi_bits[col] << 1)
                 if pixel == 0:
                     continue
 
                 pixels[px_x] = 0x10 + pal_idx * 4 + pixel
-                prio[px_x] = bool(behind_bg)
-                opaque[px_x] = True
-                if i == 0:
-                    sprite0[px_x] = True
-
-        return pixels, prio, opaque, sprite0
+                prio[px_x] = behind_bg
+                opaque[px_x] = 1
+                if is_sprite0:
+                    sprite0[px_x] = 1
 
     def get_frame(self):
         return self.screen
