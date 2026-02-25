@@ -196,51 +196,62 @@ class Mapper1:
         if address >= 0x8000:
             # PRG ROM
             prg_mode = (self.control >> 2) & 3
-            
+            prg_len = len(self.cartridge.prg_rom)
+
             if prg_mode == 0 or prg_mode == 1:
                 # 32KB mode
-                bank = (self.prg_bank >> 1) % self.prg_banks
-                return self.cartridge.prg_rom[bank * 32768 + (address - 0x8000)]
-            
+                bank32 = max(1, self.prg_banks // 2)
+                bank = (self.prg_bank >> 1) % bank32
+                offset = bank * 32768 + (address - 0x8000)
+                return self.cartridge.prg_rom[offset % prg_len]
+
             elif prg_mode == 2:
                 # Fix first bank
                 if address < 0xC000:
-                    return self.cartridge.prg_rom[address - 0x8000]
+                    return self.cartridge.prg_rom[(address - 0x8000) % prg_len]
                 else:
                     bank = self.prg_bank % self.prg_banks
-                    return self.cartridge.prg_rom[bank * 16384 + (address - 0xC000)]
-            
+                    offset = bank * 16384 + (address - 0xC000)
+                    return self.cartridge.prg_rom[offset % prg_len]
+
             else:  # prg_mode == 3
                 # Fix last bank
                 if address < 0xC000:
                     bank = self.prg_bank % self.prg_banks
-                    return self.cartridge.prg_rom[bank * 16384 + (address - 0x8000)]
+                    offset = bank * 16384 + (address - 0x8000)
+                    return self.cartridge.prg_rom[offset % prg_len]
                 else:
                     last_bank = self.prg_banks - 1
-                    return self.cartridge.prg_rom[last_bank * 16384 + (address - 0xC000)]
-        
+                    offset = last_bank * 16384 + (address - 0xC000)
+                    return self.cartridge.prg_rom[offset % prg_len]
+
         elif address >= 0x6000:
             # PRG RAM
             return self.cartridge.prg_ram[address - 0x6000]
-        
+
         return 0
     
     def read_chr(self, address):
         if len(self.cartridge.chr_rom) > 0:
             chr_mode = (self.control >> 4) & 1
-            
+            chr_len = len(self.cartridge.chr_rom)
+
             if chr_mode == 0:
                 # 8KB mode
-                bank = (self.chr_bank_0 >> 1) % self.chr_banks
-                return self.cartridge.chr_rom[bank * 8192 + address]
+                bank8 = max(1, self.chr_banks // 2)
+                bank = (self.chr_bank_0 >> 1) % bank8
+                offset = bank * 8192 + address
+                return self.cartridge.chr_rom[offset % chr_len]
             else:
                 # 4KB mode
                 if address < 0x1000:
-                    bank = self.chr_bank_0 % (self.chr_banks * 2)
-                    return self.cartridge.chr_rom[bank * 4096 + address]
+                    bank = self.chr_bank_0 % max(1, self.chr_banks)
+                    offset = bank * 4096 + address
+                    return self.cartridge.chr_rom[offset % chr_len]
                 else:
-                    bank = self.chr_bank_1 % (self.chr_banks * 2)
-                    return self.cartridge.chr_rom[bank * 4096 + (address - 0x1000)]
+                    bank = self.chr_bank_1 % max(1, self.chr_banks)
+                    offset = bank * 4096 + (address - 0x1000)
+                    return self.cartridge.chr_rom[offset % chr_len]
         else:
             return self.cartridge.chr_ram[address & 0x1FFF]
     
