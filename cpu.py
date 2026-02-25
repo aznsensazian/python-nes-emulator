@@ -163,14 +163,14 @@ class CPU:
         """(Indirect,X)"""
         ptr = (self.read(self.PC) + self.X) & 0xFF
         self.PC += 1
-        addr = self.read_word(ptr)
+        addr = self.read_word_bug(ptr)
         return addr, 0
     
     def addr_indirect_indexed(self):
         """(Indirect),Y"""
         ptr = self.read(self.PC)
         self.PC += 1
-        addr = self.read_word(ptr)
+        addr = self.read_word_bug(ptr)
         page_crossed = ((addr & 0xFF00) != ((addr + self.Y) & 0xFF00))
         return (addr + self.Y) & 0xFFFF, (1 if page_crossed else 0)
     
@@ -194,13 +194,13 @@ class CPU:
         self.set_flag(self.FLAG_C, result > 0xFF)
         self.set_flag(self.FLAG_V, ((a ^ result) & (b ^ result) & 0x80) != 0)
         self.set_zn(self.A)
-        return 1 + page_crossed
+        return page_crossed
     
     def AND(self, addr, page_crossed):
         """Logical AND"""
         self.A &= self.read(addr)
         self.set_zn(self.A)
-        return 1 + page_crossed
+        return page_crossed
     
     def ASL_ACC(self, addr, page_crossed):
         """Arithmetic Shift Left (Accumulator)"""
@@ -221,28 +221,31 @@ class CPU:
     def BCC(self, addr, page_crossed):
         """Branch if Carry Clear"""
         if not self.get_flag(self.FLAG_C):
-            self.cycles += 1
+            extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
-                self.cycles += 1
+                extra += 1
             self.PC = addr
+            return extra
         return 0
     
     def BCS(self, addr, page_crossed):
         """Branch if Carry Set"""
         if self.get_flag(self.FLAG_C):
-            self.cycles += 1
+            extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
-                self.cycles += 1
+                extra += 1
             self.PC = addr
+            return extra
         return 0
     
     def BEQ(self, addr, page_crossed):
         """Branch if Equal"""
         if self.get_flag(self.FLAG_Z):
-            self.cycles += 1
+            extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
-                self.cycles += 1
+                extra += 1
             self.PC = addr
+            return extra
         return 0
     
     def BIT(self, addr, page_crossed):
@@ -256,28 +259,31 @@ class CPU:
     def BMI(self, addr, page_crossed):
         """Branch if Minus"""
         if self.get_flag(self.FLAG_N):
-            self.cycles += 1
+            extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
-                self.cycles += 1
+                extra += 1
             self.PC = addr
+            return extra
         return 0
     
     def BNE(self, addr, page_crossed):
         """Branch if Not Equal"""
         if not self.get_flag(self.FLAG_Z):
-            self.cycles += 1
+            extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
-                self.cycles += 1
+                extra += 1
             self.PC = addr
+            return extra
         return 0
     
     def BPL(self, addr, page_crossed):
         """Branch if Positive"""
         if not self.get_flag(self.FLAG_N):
-            self.cycles += 1
+            extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
-                self.cycles += 1
+                extra += 1
             self.PC = addr
+            return extra
         return 0
     
     def BRK(self, addr, page_crossed):
@@ -292,19 +298,21 @@ class CPU:
     def BVC(self, addr, page_crossed):
         """Branch if Overflow Clear"""
         if not self.get_flag(self.FLAG_V):
-            self.cycles += 1
+            extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
-                self.cycles += 1
+                extra += 1
             self.PC = addr
+            return extra
         return 0
     
     def BVS(self, addr, page_crossed):
         """Branch if Overflow Set"""
         if self.get_flag(self.FLAG_V):
-            self.cycles += 1
+            extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
-                self.cycles += 1
+                extra += 1
             self.PC = addr
+            return extra
         return 0
     
     def CLC(self, addr, page_crossed):
@@ -333,7 +341,7 @@ class CPU:
         result = self.A - value
         self.set_flag(self.FLAG_C, self.A >= value)
         self.set_zn(result)
-        return 1 + page_crossed
+        return page_crossed
     
     def CPX(self, addr, page_crossed):
         """Compare X Register"""
@@ -374,7 +382,7 @@ class CPU:
         """Exclusive OR"""
         self.A ^= self.read(addr)
         self.set_zn(self.A)
-        return 1 + page_crossed
+        return page_crossed
     
     def INC(self, addr, page_crossed):
         """Increment Memory"""
@@ -410,19 +418,19 @@ class CPU:
         """Load Accumulator"""
         self.A = self.read(addr)
         self.set_zn(self.A)
-        return 1 + page_crossed
+        return page_crossed
     
     def LDX(self, addr, page_crossed):
         """Load X Register"""
         self.X = self.read(addr)
         self.set_zn(self.X)
-        return 1 + page_crossed
+        return page_crossed
     
     def LDY(self, addr, page_crossed):
         """Load Y Register"""
         self.Y = self.read(addr)
         self.set_zn(self.Y)
-        return 1 + page_crossed
+        return page_crossed
     
     def LSR_ACC(self, addr, page_crossed):
         """Logical Shift Right (Accumulator)"""
@@ -442,13 +450,13 @@ class CPU:
     
     def NOP(self, addr, page_crossed):
         """No Operation"""
-        return 1 + page_crossed
+        return page_crossed
     
     def ORA(self, addr, page_crossed):
         """Logical OR"""
         self.A |= self.read(addr)
         self.set_zn(self.A)
-        return 1 + page_crossed
+        return page_crossed
     
     def PHA(self, addr, page_crossed):
         """Push Accumulator"""
@@ -529,7 +537,7 @@ class CPU:
         self.set_flag(self.FLAG_C, result >= 0)
         self.set_flag(self.FLAG_V, ((a ^ b) & (a ^ result) & 0x80) != 0)
         self.set_zn(self.A)
-        return 1 + page_crossed
+        return page_crossed
     
     def SEC(self, addr, page_crossed):
         """Set Carry Flag"""
@@ -603,7 +611,7 @@ class CPU:
         self.A = value
         self.X = value
         self.set_zn(value)
-        return 1 + page_crossed
+        return page_crossed
     
     def SAX(self, addr, page_crossed):
         """Store A AND X"""
@@ -972,6 +980,9 @@ class CPU:
         self.opcodes[0x63] = (self.RRA, self.addr_indexed_indirect, 8)
         self.opcodes[0x73] = (self.RRA, self.addr_indirect_indexed, 8)
         
+        # Unofficial SBC (identical to official SBC immediate)
+        self.opcodes[0xEB] = (self.SBC, self.addr_immediate, 2)
+
         # Unofficial NOPs
         nop_opcodes = [0x1A, 0x3A, 0x5A, 0x7A, 0xDA, 0xFA]
         for opcode in nop_opcodes:

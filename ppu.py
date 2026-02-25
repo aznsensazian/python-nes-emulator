@@ -111,9 +111,12 @@ class PPU:
             if self.ctrl & 0x80:
                 nmi = True
         elif sl == 261:
-            # pre-render
+            # pre-render: clear VBlank, sprite 0 hit, sprite overflow
             self.status &= 0x1F
             self.frame_ready = False
+            # Copy all of t to v at pre-render scanline (when rendering enabled)
+            if self.mask & 0x18:
+                self.v = self.t
 
         # advance scanline
         self.scanline += 1
@@ -268,11 +271,25 @@ class PPU:
         palette_rgb = self.palette
         read_chr = self.nes.cartridge.read_chr
 
+        # Copy horizontal scroll bits from t to v at start of each visible scanline
+        self.v = (self.v & ~0x041F) | (self.t & 0x041F)
+
         # -- Background --
         bg_pixels = self._render_bg_scanline(y, read_chr)
 
         # -- Sprites --
-        sprite_pixels, sprite_prio, sprite_opaque = self._render_sprite_scanline(y, read_chr)
+        sprite_pixels, sprite_prio, sprite_opaque, sprite0_opaque = self._render_sprite_scanline(y, read_chr)
+
+        # -- Sprite 0 hit detection --
+        if not (self.status & 0x40):  # Not already set this frame
+            if (self.mask & 0x18) == 0x18:  # Both bg and sprites enabled
+                both_left = (self.mask & 0x06) == 0x06
+                for px in range(255):  # x=255 doesn't trigger on real hardware
+                    if px < 8 and not both_left:
+                        continue
+                    if sprite0_opaque[px] and (bg_pixels[px] & 3):
+                        self.status |= 0x40
+                        break
 
         # -- Compose --
         for px in range(256):
@@ -291,88 +308,100 @@ class PPU:
 
             screen_row[px] = palette_rgb[palette_ram[color] & 0x3F]
 
+        # Y increment at end of visible scanline
+        self._y_increment()
+
     def _render_bg_scanline(self, y, read_chr):
         """Return 256-element list of palette indices for background.
-        Processes tile-by-tile to minimise VRAM reads."""
+        Uses v register for scroll position (proper NES PPU behavior)."""
         bg = [0] * 256
         if not (self.mask & 0x08):
             return bg
 
-        sx = self.scroll_x
-        sy = self.scroll_y
-        base_nt = (self.ctrl & 3)
+        # Extract scroll position from v register
+        v = self.v
+        coarse_x = v & 0x1F
+        coarse_y = (v >> 5) & 0x1F
+        fine_y = (v >> 12) & 0x7
+        nt_h = (v >> 10) & 1  # horizontal nametable bit
+        nt_v = (v >> 11) & 1  # vertical nametable bit
+        fine_x = self.x
+
         pattern_table = 0x1000 if (self.ctrl & 0x10) else 0
         clip_left = not (self.mask & 0x02)
 
-        eff_y = (y + sy) % 480
-        nt_row = 0 if eff_y < 240 else 1
-        local_y = eff_y if eff_y < 240 else eff_y - 240
-        tile_row = local_y >> 3
-        fine_y = local_y & 7
-
         vram = self.vram
         mirror_nt = self.mirror_nametable
-        base_nt_h = base_nt & 1
-        base_nt_v = (base_nt >> 1) & 1
-
-        # Cache: key = (nt_index, tile_col) -> (lo, hi, pal_base)
-        # Avoid re-reading same tile data when fine_x != 0
-        _cache = {}
 
         px = 0
+        tile_col = coarse_x
+        cur_nt_h = nt_h
+        first_tile = True
+
         while px < 256:
-            eff_x = (px + sx) & 511  # mod 512
-            nt_col = 1 if eff_x >= 256 else 0
-            local_x = eff_x & 255
+            # Calculate nametable base address
+            nt_index = cur_nt_h | (nt_v << 1)
+            nt_base = 0x2000 + nt_index * 0x400
 
-            nt_index = (base_nt_h ^ nt_col) | ((base_nt_v ^ nt_row) << 1)
-            tile_col = local_x >> 3
-            fine_x = local_x & 7
+            # Get tile index from nametable
+            tile_idx = vram[mirror_nt(nt_base + coarse_y * 32 + tile_col)]
+            pat_addr = pattern_table + tile_idx * 16 + fine_y
+            lo = read_chr(pat_addr)
+            hi = read_chr(pat_addr + 8)
 
-            # How many pixels left in this tile from fine_x?
-            run = 8 - fine_x
-            if px + run > 256:
-                run = 256 - px
+            # Get palette from attribute table
+            attr_addr = nt_base + 0x3C0 + (coarse_y >> 2) * 8 + (tile_col >> 2)
+            attr = vram[mirror_nt(attr_addr)]
+            shift = ((coarse_y & 2) << 1) | (tile_col & 2)
+            pal_base = ((attr >> shift) & 3) << 2
 
-            cache_key = (nt_index, tile_col)
-            cached = _cache.get(cache_key)
-            if cached is None:
-                nt_base = 0x2000 + nt_index * 0x400
-                tile_idx = vram[mirror_nt(nt_base + tile_row * 32 + tile_col)]
-                pat_addr = pattern_table + tile_idx * 16 + fine_y
-                lo = read_chr(pat_addr)
-                hi = read_chr(pat_addr + 8)
+            # Determine pixel range within this tile
+            start = fine_x if first_tile else 0
+            first_tile = False
 
-                attr_addr = nt_base + 0x3C0 + (tile_row >> 2) * 8 + (tile_col >> 2)
-                attr = vram[mirror_nt(attr_addr)]
-                shift = ((tile_row & 2) << 1) | (tile_col & 2)
-                pal_base = ((attr >> shift) & 3) << 2  # * 4
-                cached = (lo, hi, pal_base)
-                _cache[cache_key] = cached
-            else:
-                lo, hi, pal_base = cached
+            for i in range(start, 8):
+                if px >= 256:
+                    break
+                if not (px < 8 and clip_left):
+                    bit = 7 - i
+                    pixel = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1)
+                    if pixel:
+                        bg[px] = pal_base + pixel
+                px += 1
 
-            for i in range(run):
-                cpx = px + i
-                if cpx < 8 and clip_left:
-                    continue
-                bit = 7 - (fine_x + i)
-                pixel = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1)
-                if pixel:
-                    bg[cpx] = pal_base + pixel
-
-            px += run
+            # Advance to next tile column
+            tile_col += 1
+            if tile_col >= 32:
+                tile_col = 0
+                cur_nt_h ^= 1  # Switch horizontal nametable
 
         return bg
 
+    def _y_increment(self):
+        """Increment fine Y in v register, wrapping to coarse Y as needed."""
+        if (self.v & 0x7000) != 0x7000:
+            self.v += 0x1000  # increment fine Y
+        else:
+            self.v &= ~0x7000  # fine Y = 0
+            y = (self.v & 0x03E0) >> 5  # coarse Y
+            if y == 29:
+                y = 0
+                self.v ^= 0x0800  # switch vertical nametable
+            elif y == 31:
+                y = 0  # don't toggle nametable at 31
+            else:
+                y += 1
+            self.v = (self.v & ~0x03E0) | (y << 5)
+
     def _render_sprite_scanline(self, y, read_chr):
-        """Return (pixels[256], priority[256], opaque[256]) for sprites."""
+        """Return (pixels[256], priority[256], opaque[256], sprite0_opaque[256])."""
         pixels = [0] * 256
         prio = [False] * 256
         opaque = [False] * 256
+        sprite0 = [False] * 256
 
         if not (self.mask & 0x10):
-            return pixels, prio, opaque
+            return pixels, prio, opaque, sprite0
 
         sprite_size = 16 if (self.ctrl & 0x20) else 8
         oam = self.oam
@@ -431,8 +460,10 @@ class PPU:
                 pixels[px_x] = 0x10 + pal_idx * 4 + pixel
                 prio[px_x] = bool(behind_bg)
                 opaque[px_x] = True
+                if i == 0:
+                    sprite0[px_x] = True
 
-        return pixels, prio, opaque
+        return pixels, prio, opaque, sprite0
 
     def get_frame(self):
         return self.screen
