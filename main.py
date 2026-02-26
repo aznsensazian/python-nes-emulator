@@ -25,21 +25,27 @@ KEY_MAP = {
 
 # Audio constants
 SAMPLE_RATE = 44100
-AUDIO_BUFFER_SIZE = 1024  # frames per chunk
-NES_CPU_FREQ = 1789773  # NTSC CPU frequency
+AUDIO_CHUNK = 1024  # samples per Sound object
 
 
 class AudioStreamer:
-    """Streams audio from APU sample buffer to pygame.mixer."""
+    """Streams audio via pygame.mixer double-buffering (play + queue).
+
+    Never falls back to sound.play() on random channels — if both the
+    playing and queued slots are occupied we hold samples locally until
+    the channel drains.
+    """
 
     def __init__(self):
         self.pending = []
-        self.chunk_size = AUDIO_BUFFER_SIZE
+        self.chunk_size = AUDIO_CHUNK
         self.channel = None
         self.stereo = False
+        self._sounds = []  # prevent GC of in-flight Sound objects
 
         try:
-            pygame.mixer.init(frequency=SAMPLE_RATE, size=-16, channels=1, buffer=512)
+            pygame.mixer.init(frequency=SAMPLE_RATE, size=-16, channels=1,
+                              buffer=1024)
             self.enabled = True
             self.channel = pygame.mixer.Channel(0)
             mixer_info = pygame.mixer.get_init()
@@ -50,14 +56,32 @@ class AudioStreamer:
             self.enabled = False
 
     def push_samples(self, samples):
-        """Queue int16 samples from the APU for playback."""
+        """Accept int16 samples from the APU and flush into the channel."""
         if not self.enabled or not samples:
             return
         self.pending.extend(samples)
-        while len(self.pending) >= self.chunk_size:
-            self._flush()
 
-    def _flush(self):
+        # Cap to ~0.25 s to bound memory and latency
+        max_pending = SAMPLE_RATE // 4
+        if len(self.pending) > max_pending:
+            self.pending = self.pending[-max_pending:]
+
+        self._try_flush()
+
+    def _try_flush(self):
+        ch = self.channel
+        while len(self.pending) >= self.chunk_size:
+            if not ch.get_busy():
+                # Nothing playing — start playback
+                self._play_chunk(start=True)
+            elif not ch.get_queue():
+                # Playing but queue empty — fill the queue
+                self._play_chunk(start=False)
+            else:
+                # Both slots occupied — wait until next push
+                break
+
+    def _play_chunk(self, start):
         chunk = self.pending[:self.chunk_size]
         self.pending = self.pending[self.chunk_size:]
 
@@ -66,10 +90,15 @@ class AudioStreamer:
             arr = np.column_stack((arr, arr))
 
         sound = pygame.sndarray.make_sound(arr)
-        if self.channel and not self.channel.get_queue():
-            self.channel.queue(sound)
+        if start:
+            self.channel.play(sound)
         else:
-            sound.play()
+            self.channel.queue(sound)
+
+        # Hold reference so SDL doesn't collect while playing
+        self._sounds.append(sound)
+        if len(self._sounds) > 4:
+            self._sounds.pop(0)
 
     def close(self):
         if self.enabled:
@@ -98,10 +127,6 @@ class Emulator:
 
         # Audio
         self.audio = AudioStreamer()
-
-        # Timing
-        self.clock = pygame.time.Clock()
-        self.target_fps = 60
 
         # FPS tracking
         self.frame_count = 0
@@ -133,11 +158,14 @@ class Emulator:
     def render(self):
         frame = self.nes.get_frame()
         # Transpose from (row, col, rgb) to pygame's (col, row, rgb)
-        pygame.surfarray.blit_array(self.nes_surface, np.transpose(frame, (1, 0, 2)))
-        pygame.transform.scale(self.nes_surface, (self.width, self.height), self.screen)
+        pygame.surfarray.blit_array(self.nes_surface,
+                                    np.transpose(frame, (1, 0, 2)))
+        pygame.transform.scale(self.nes_surface,
+                               (self.width, self.height), self.screen)
 
         if self.show_fps:
-            fps_text = self.font.render(f"FPS: {self.fps:.1f}", True, (255, 255, 0))
+            fps_text = self.font.render(f"FPS: {self.fps:.1f}", True,
+                                        (255, 255, 0))
             self.screen.blit(fps_text, (10, 10))
 
         pygame.display.flip()
@@ -160,15 +188,40 @@ class Emulator:
         print("  F1: Toggle FPS  |  ESC: Quit")
         print("=" * 50 + "\n")
 
+        # Adaptive frame timing — run extra emulator frames (skip render)
+        # when behind schedule so audio stays closer to real-time.
+        NES_FRAME_TIME = 1.0 / 60.0
+        next_frame = time.perf_counter()
+        audio = self.audio
+        apu_get = self.nes.apu.get_audio_buffer
+        step_frame = self.nes.step_frame
+
         while self.running:
             self.handle_input()
-            self.nes.step_frame()
-            # Pull audio samples generated during the frame and queue for playback
-            self.audio.push_samples(self.nes.apu.get_audio_buffer())
+
+            now = time.perf_counter()
+            # How many NES frames we owe (at least 1, cap at 3)
+            behind = int((now - next_frame) / NES_FRAME_TIME) + 1
+            if behind > 3:
+                behind = 3
+                next_frame = now  # reset to avoid death spiral
+
+            for i in range(behind):
+                step_frame()
+                next_frame += NES_FRAME_TIME
+
+            # Push ALL generated audio (from all emulated frames)
+            audio.push_samples(apu_get())
+
+            # Render only the last frame
             self.render()
-            self.clock.tick(self.target_fps)
             self.frame_count += 1
             self.update_fps()
+
+            # Sleep if ahead of schedule
+            remaining = next_frame - time.perf_counter()
+            if remaining > 0.001:
+                time.sleep(remaining - 0.001)
 
         # Cleanup
         self.audio.close()
