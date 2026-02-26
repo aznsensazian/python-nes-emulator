@@ -5,35 +5,41 @@ Basic implementation of audio channels
 
 import numpy as np
 
+NES_CPU_FREQ = 1789773  # NTSC CPU frequency
+SAMPLE_RATE = 44100
+
+
 class APU:
     def __init__(self, nes):
         self.nes = nes
-        
+
         # Pulse channels
         self.pulse1 = PulseChannel()
         self.pulse2 = PulseChannel()
-        
+
         # Triangle channel
         self.triangle = TriangleChannel()
-        
+
         # Noise channel
         self.noise = NoiseChannel()
-        
+
         # DMC channel
         self.dmc = DMCChannel()
-        
+
         # Frame counter
         self.frame_counter = 0
         self.frame_mode = 0  # 0 = 4-step, 1 = 5-step
         self.frame_irq = False
-        
+
         # Cycle counter
         self.cycles = 0
-        
-        # Audio buffer
-        self.sample_rate = 44100
-        self.buffer = []
-    
+
+        # Audio sample generation
+        self.sample_rate = SAMPLE_RATE
+        self.cycles_per_sample = NES_CPU_FREQ / SAMPLE_RATE  # ~40.58
+        self.sample_accum = 0.0
+        self.audio_buffer = []
+
     def reset(self):
         """Reset APU"""
         self.pulse1.reset()
@@ -45,7 +51,8 @@ class APU:
         self.frame_mode = 0
         self.frame_irq = False
         self.cycles = 0
-        self.buffer = []
+        self.sample_accum = 0.0
+        self.audio_buffer = []
     
     def read_register(self, address):
         """Read from APU register"""
@@ -197,6 +204,40 @@ class APU:
                     feedback = (n.shift_register & 1) ^ ((n.shift_register >> (6 if n.mode else 1)) & 1)
                     n.shift_register = (n.shift_register >> 1) | (feedback << 14)
                     rem -= 1
+
+        # Generate audio samples at the correct rate (~40.58 CPU cycles per sample)
+        self.sample_accum += cpu_cycles
+        cps = self.cycles_per_sample
+        buf = self.audio_buffer
+        while self.sample_accum >= cps:
+            self.sample_accum -= cps
+            buf.append(self._mix())
+
+    def _mix(self):
+        """Mix all channels and return a single int16 audio sample."""
+        p1 = self.pulse1.output()
+        p2 = self.pulse2.output()
+        tri = self.triangle.output()
+        noi = self.noise.output()
+        dmc = self.dmc.output()
+
+        # NES linear mixing approximation
+        pulse_out = 0.00752 * (p1 + p2)
+        tnd_out = 0.00851 * tri + 0.00494 * noi + 0.00335 * dmc
+
+        # Scale to int16 range (max output ~0.85, * 25000 ≈ 21250)
+        val = int((pulse_out + tnd_out) * 25000)
+        if val > 32767:
+            val = 32767
+        elif val < -32768:
+            val = -32768
+        return val
+
+    def get_audio_buffer(self):
+        """Return accumulated audio samples and clear the buffer."""
+        buf = self.audio_buffer
+        self.audio_buffer = []
+        return buf
     
     def clock_frame_counter(self):
         """Clock frame counter"""

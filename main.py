@@ -30,63 +30,45 @@ NES_CPU_FREQ = 1789773  # NTSC CPU frequency
 
 
 class AudioStreamer:
-    """Ring-buffer backed audio streamer using pygame.mixer + Sound queue."""
+    """Streams audio from APU sample buffer to pygame.mixer."""
 
-    def __init__(self, apu):
-        self.apu = apu
-        self.sample_rate = SAMPLE_RATE
-        self.cycles_per_sample = NES_CPU_FREQ / SAMPLE_RATE
-        self.cycle_accum = 0.0
-        self.buffer = []
+    def __init__(self):
+        self.pending = []
         self.chunk_size = AUDIO_BUFFER_SIZE
         self.channel = None
+        self.stereo = False
 
         try:
             pygame.mixer.init(frequency=SAMPLE_RATE, size=-16, channels=1, buffer=512)
             self.enabled = True
             self.channel = pygame.mixer.Channel(0)
+            mixer_info = pygame.mixer.get_init()
+            if mixer_info and mixer_info[2] == 2:
+                self.stereo = True
         except Exception as e:
             print(f"Audio init failed: {e}")
             self.enabled = False
 
-    def push_cycles(self, cpu_cycles):
-        """Call after each CPU step with the number of CPU cycles elapsed.
-        Generates audio samples at the correct rate."""
-        if not self.enabled:
+    def push_samples(self, samples):
+        """Queue int16 samples from the APU for playback."""
+        if not self.enabled or not samples:
             return
-        self.cycle_accum += cpu_cycles
-        while self.cycle_accum >= self.cycles_per_sample:
-            self.cycle_accum -= self.cycles_per_sample
-            sample = self.apu.sample()
-            # Convert float 0..1-ish to int16
-            val = int(sample * 12000)
-            if val > 32767:
-                val = 32767
-            elif val < -32768:
-                val = -32768
-            self.buffer.append(val)
-
-        # When we have enough samples, queue audio
-        if len(self.buffer) >= self.chunk_size:
+        self.pending.extend(samples)
+        while len(self.pending) >= self.chunk_size:
             self._flush()
 
     def _flush(self):
-        if not self.buffer:
-            return
-        arr = np.array(self.buffer[:self.chunk_size], dtype=np.int16)
-        self.buffer = self.buffer[self.chunk_size:]
-        
-        # Get mixer config to handle mono/stereo properly
-        mixer_info = pygame.mixer.get_init()
-        if mixer_info and mixer_info[2] == 2:  # Stereo
-            # Convert mono to stereo by duplicating the channel
+        chunk = self.pending[:self.chunk_size]
+        self.pending = self.pending[self.chunk_size:]
+
+        arr = np.array(chunk, dtype=np.int16)
+        if self.stereo:
             arr = np.column_stack((arr, arr))
-        
+
         sound = pygame.sndarray.make_sound(arr)
         if self.channel and not self.channel.get_queue():
             self.channel.queue(sound)
         else:
-            # If queue is full, just play (may cause slight skip)
             sound.play()
 
     def close(self):
@@ -115,7 +97,7 @@ class Emulator:
         self.nes_surface = pygame.Surface((256, 240))
 
         # Audio
-        self.audio = AudioStreamer(self.nes.apu)
+        self.audio = AudioStreamer()
 
         # Timing
         self.clock = pygame.time.Clock()
@@ -178,20 +160,11 @@ class Emulator:
         print("  F1: Toggle FPS  |  ESC: Quit")
         print("=" * 50 + "\n")
 
-        # Hook audio into the NES step loop
-        _orig_step = self.nes.step
-        audio = self.audio
-
-        def step_with_audio():
-            cycles = _orig_step()
-            audio.push_cycles(cycles)
-            return cycles
-
-        self.nes.step = step_with_audio
-
         while self.running:
             self.handle_input()
             self.nes.step_frame()
+            # Pull audio samples generated during the frame and queue for playback
+            self.audio.push_samples(self.nes.apu.get_audio_buffer())
             self.render()
             self.clock.tick(self.target_fps)
             self.frame_count += 1
