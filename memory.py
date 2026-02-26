@@ -12,31 +12,30 @@ class Memory:
     def read(self, address):
         """Read byte from memory"""
         address &= 0xFFFF
-        
+
+        # Cartridge space (0x4020-0xFFFF) - checked first as instruction
+        # fetches are the most common reads
+        if address >= 0x4020:
+            return self.nes.cartridge.read(address)
+
         # RAM (0x0000-0x1FFF) - mirrored every 0x0800 bytes
         if address < 0x2000:
             return self.ram[address & 0x07FF]
-        
+
         # PPU Registers (0x2000-0x3FFF) - mirrored every 8 bytes
-        elif address < 0x4000:
+        if address < 0x4000:
             return self.nes.ppu.read_register(0x2000 + (address & 0x0007))
-        
+
         # APU and I/O Registers (0x4000-0x4017)
-        elif address < 0x4018:
+        if address < 0x4018:
             if address == 0x4016:
                 return self.nes.controller1.read()
-            elif address == 0x4017:
+            if address == 0x4017:
                 return self.nes.controller2.read()
-            else:
-                return self.nes.apu.read_register(address)
-        
+            return self.nes.apu.read_register(address)
+
         # APU and I/O functionality (0x4018-0x401F) - normally disabled
-        elif address < 0x4020:
-            return 0
-        
-        # Cartridge space (0x4020-0xFFFF)
-        else:
-            return self.nes.cartridge.read(address)
+        return 0
     
     def write(self, address, value):
         """Write byte to memory"""
