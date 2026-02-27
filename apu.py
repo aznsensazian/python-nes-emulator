@@ -33,6 +33,7 @@ class APU:
 
         # Cycle counter
         self.cycles = 0
+        self._next_frame_trigger = 7457
 
         # Audio sample generation
         self.sample_rate = SAMPLE_RATE
@@ -51,6 +52,7 @@ class APU:
         self.frame_mode = 0
         self.frame_irq = False
         self.cycles = 0
+        self._next_frame_trigger = 7457
         self.sample_accum = 0.0
         self.audio_buffer = []
     
@@ -153,84 +155,150 @@ class APU:
         self.clock(1)
 
     def clock(self, cpu_cycles):
-        """Step APU by multiple CPU cycles at once (performance optimization)."""
-        old_cycles = self.cycles
+        """Step APU by multiple CPU cycles at once (performance optimization).
+
+        Uses fast-path comparisons instead of while-loops and min() calls
+        for the common case where timer > cpu_cycles (~95% of calls).
+        """
         self.cycles += cpu_cycles
 
-        # Check if any frame counter triggers crossed (every 7457 cycles)
-        old_frame = old_cycles // 7457
-        new_frame = self.cycles // 7457
-        for _ in range(new_frame - old_frame):
+        # Frame counter: comparison vs next trigger (replaces 2 divisions/call)
+        while self.cycles >= self._next_frame_trigger:
+            self._next_frame_trigger += 7457
             self.clock_frame_counter()
 
-        # Inline triangle timer clocking (runs every CPU cycle)
+        # Triangle timer (runs at CPU rate) — fast path
         tri = self.triangle
-        remaining = cpu_cycles
-        while remaining > 0:
-            if tri.timer > 0:
-                ticks = min(remaining, tri.timer)
-                tri.timer -= ticks
-                remaining -= ticks
-            else:
-                tri.timer = tri.timer_period
-                if tri.length_counter > 0 and tri.linear_counter > 0:
-                    tri.sequence_pos = (tri.sequence_pos + 1) & 31
-                remaining -= 1
+        if tri.timer >= cpu_cycles:
+            tri.timer -= cpu_cycles
+        else:
+            remaining = cpu_cycles
+            while remaining > 0:
+                if tri.timer > 0:
+                    if tri.timer >= remaining:
+                        tri.timer -= remaining
+                        break
+                    remaining -= tri.timer
+                    tri.timer = 0
+                else:
+                    tri.timer = tri.timer_period
+                    if tri.length_counter > 0 and tri.linear_counter > 0:
+                        tri.sequence_pos = (tri.sequence_pos + 1) & 31
+                    remaining -= 1
 
-        # Inline pulse and noise timer clocking (runs every other CPU cycle)
-        half_cycles = cpu_cycles >> 1
-        if half_cycles > 0:
-            for ch in (self.pulse1, self.pulse2):
-                rem = half_cycles
+        # Pulse and noise timers (run at half CPU rate)
+        half = cpu_cycles >> 1
+        if half > 0:
+            # Pulse 1 — fast path
+            p1 = self.pulse1
+            if p1.timer >= half:
+                p1.timer -= half
+            else:
+                rem = half
                 while rem > 0:
-                    if ch.timer > 0:
-                        ticks = min(rem, ch.timer)
-                        ch.timer -= ticks
-                        rem -= ticks
+                    if p1.timer > 0:
+                        if p1.timer >= rem:
+                            p1.timer -= rem
+                            break
+                        rem -= p1.timer
+                        p1.timer = 0
                     else:
-                        ch.timer = ch.timer_period
-                        ch.sequence_pos = (ch.sequence_pos + 1) & 7
+                        p1.timer = p1.timer_period
+                        p1.sequence_pos = (p1.sequence_pos + 1) & 7
                         rem -= 1
 
-            n = self.noise
-            rem = half_cycles
-            while rem > 0:
-                if n.timer > 0:
-                    ticks = min(rem, n.timer)
-                    n.timer -= ticks
-                    rem -= ticks
-                else:
-                    n.timer = n.timer_period
-                    feedback = (n.shift_register & 1) ^ ((n.shift_register >> (6 if n.mode else 1)) & 1)
-                    n.shift_register = (n.shift_register >> 1) | (feedback << 14)
-                    rem -= 1
+            # Pulse 2 — fast path
+            p2 = self.pulse2
+            if p2.timer >= half:
+                p2.timer -= half
+            else:
+                rem = half
+                while rem > 0:
+                    if p2.timer > 0:
+                        if p2.timer >= rem:
+                            p2.timer -= rem
+                            break
+                        rem -= p2.timer
+                        p2.timer = 0
+                    else:
+                        p2.timer = p2.timer_period
+                        p2.sequence_pos = (p2.sequence_pos + 1) & 7
+                        rem -= 1
 
-        # Generate audio samples at the correct rate (~40.58 CPU cycles per sample)
+            # Noise — fast path
+            n = self.noise
+            if n.timer >= half:
+                n.timer -= half
+            else:
+                rem = half
+                while rem > 0:
+                    if n.timer > 0:
+                        if n.timer >= rem:
+                            n.timer -= rem
+                            break
+                        rem -= n.timer
+                        n.timer = 0
+                    else:
+                        n.timer = n.timer_period
+                        feedback = (n.shift_register & 1) ^ (
+                            (n.shift_register >> (6 if n.mode else 1)) & 1)
+                        n.shift_register = (n.shift_register >> 1) | (feedback << 14)
+                        rem -= 1
+
+        # Audio sample generation (~40.58 CPU cycles per sample)
         self.sample_accum += cpu_cycles
-        cps = self.cycles_per_sample
-        buf = self.audio_buffer
-        while self.sample_accum >= cps:
-            self.sample_accum -= cps
-            buf.append(self._mix())
+        if self.sample_accum >= self.cycles_per_sample:
+            cps = self.cycles_per_sample
+            buf = self.audio_buffer
+            _mix = self._mix
+            while self.sample_accum >= cps:
+                self.sample_accum -= cps
+                buf.append(_mix())
 
     def _mix(self):
-        """Mix all channels and return a single int16 audio sample."""
-        p1 = self.pulse1.output()
-        p2 = self.pulse2.output()
-        tri = self.triangle.output()
-        noi = self.noise.output()
-        dmc = self.dmc.output()
+        """Mix all channels into a single int16 sample (inlined outputs)."""
+        # Pulse 1 — inline output()
+        p1 = self.pulse1
+        if (p1.enabled and p1.length_counter > 0
+                and 8 <= p1.timer_period <= 0x7FF
+                and p1.duty_sequences[p1.duty_cycle][p1.sequence_pos]):
+            v1 = p1.volume if p1.constant_volume else p1.envelope_volume
+        else:
+            v1 = 0
 
-        # NES linear mixing approximation
-        pulse_out = 0.00752 * (p1 + p2)
-        tnd_out = 0.00851 * tri + 0.00494 * noi + 0.00335 * dmc
+        # Pulse 2 — inline output()
+        p2 = self.pulse2
+        if (p2.enabled and p2.length_counter > 0
+                and 8 <= p2.timer_period <= 0x7FF
+                and p2.duty_sequences[p2.duty_cycle][p2.sequence_pos]):
+            v2 = p2.volume if p2.constant_volume else p2.envelope_volume
+        else:
+            v2 = 0
 
-        # Scale to int16 range (max output ~0.85, * 25000 ≈ 21250)
-        val = int((pulse_out + tnd_out) * 25000)
+        # Triangle — inline output()
+        tri = self.triangle
+        t = (tri.sequence[tri.sequence_pos]
+             if (tri.enabled and tri.length_counter > 0 and tri.linear_counter > 0)
+             else 0)
+
+        # Noise — inline output()
+        noi = self.noise
+        if (noi.enabled and noi.length_counter > 0
+                and not (noi.shift_register & 1)):
+            nv = noi.volume if noi.constant_volume else noi.envelope_volume
+        else:
+            nv = 0
+
+        # DMC — direct access
+        d = self.dmc.output_level
+
+        # Pre-computed constants: coeff * 25000
+        # 0.00752*25000=188, 0.00851*25000=212.75, 0.00494*25000=123.5, 0.00335*25000=83.75
+        val = int(188.0 * (v1 + v2) + 212.75 * t + 123.5 * nv + 83.75 * d)
         if val > 32767:
-            val = 32767
-        elif val < -32768:
-            val = -32768
+            return 32767
+        if val < -32768:
+            return -32768
         return val
 
     def get_audio_buffer(self):
