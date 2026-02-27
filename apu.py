@@ -41,6 +41,19 @@ class APU:
         self.sample_accum = 0.0
         self.audio_buffer = []
 
+        # Audio filters (matches NES hardware filtering)
+        # Low-pass ~14 kHz: alpha = dt / (RC + dt), RC = 1/(2*pi*14000)
+        self._lpf_alpha = 0.666
+        self._lpf_prev = 0.0
+        # High-pass ~37 Hz: removes DC offset, alpha = RC / (RC + dt)
+        self._hpf1_alpha = 0.9947
+        self._hpf1_prev_x = 0.0
+        self._hpf1_prev_y = 0.0
+        # High-pass ~440 Hz: removes low rumble
+        self._hpf2_alpha = 0.9405
+        self._hpf2_prev_x = 0.0
+        self._hpf2_prev_y = 0.0
+
     def reset(self):
         """Reset APU"""
         self.pulse1.reset()
@@ -55,6 +68,11 @@ class APU:
         self._next_frame_trigger = 7457
         self.sample_accum = 0.0
         self.audio_buffer = []
+        self._lpf_prev = 0.0
+        self._hpf1_prev_x = 0.0
+        self._hpf1_prev_y = 0.0
+        self._hpf2_prev_x = 0.0
+        self._hpf2_prev_y = 0.0
     
     def read_register(self, address):
         """Read from APU register"""
@@ -251,9 +269,37 @@ class APU:
             cps = self.cycles_per_sample
             buf = self.audio_buffer
             _mix = self._mix
+            # Cache filter state locally for speed
+            lpf = self._lpf_prev
+            h1x = self._hpf1_prev_x
+            h1y = self._hpf1_prev_y
+            h2x = self._hpf2_prev_x
+            h2y = self._hpf2_prev_y
+            lp_a = self._lpf_alpha
+            h1_a = self._hpf1_alpha
+            h2_a = self._hpf2_alpha
             while self.sample_accum >= cps:
                 self.sample_accum -= cps
-                buf.append(_mix())
+                raw = _mix()
+                # Low-pass filter (~14 kHz) — removes harsh square wave harmonics
+                lpf += lp_a * (raw - lpf)
+                # High-pass filter 1 (~37 Hz) — removes DC offset
+                h1y = h1_a * (h1y + lpf - h1x)
+                h1x = lpf
+                # High-pass filter 2 (~440 Hz) — removes low rumble
+                h2y = h2_a * (h2y + h1y - h2x)
+                h2x = h1y
+                # Clamp to int16
+                s = int(h2y)
+                if s > 32767: s = 32767
+                elif s < -32768: s = -32768
+                buf.append(s)
+            # Write back filter state
+            self._lpf_prev = lpf
+            self._hpf1_prev_x = h1x
+            self._hpf1_prev_y = h1y
+            self._hpf2_prev_x = h2x
+            self._hpf2_prev_y = h2y
 
     def _mix(self):
         """Mix all channels into a single int16 sample (inlined outputs)."""
@@ -276,9 +322,12 @@ class APU:
             v2 = 0
 
         # Triangle — inline output()
+        # Silence when timer_period < 2: produces ultrasonic frequencies that
+        # alias into audible static.  Real NES hardware filters these naturally.
         tri = self.triangle
         t = (tri.sequence[tri.sequence_pos]
-             if (tri.enabled and tri.length_counter > 0 and tri.linear_counter > 0)
+             if (tri.enabled and tri.length_counter > 0
+                 and tri.linear_counter > 0 and tri.timer_period >= 2)
              else 0)
 
         # Noise — inline output()
