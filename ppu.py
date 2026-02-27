@@ -80,16 +80,18 @@ class PPU:
 
         # Pre-allocated scanline buffers (reused every scanline to avoid allocations)
         self._bg_pixels = [0] * 256
-        self._sp_pixels = [0] * 256
-        self._sp_prio = [0] * 256
         self._sp_opaque = [0] * 256
-        self._sp0_opaque = [0] * 256
 
         # Pre-computed bit decode table: byte -> tuple of 8 bit values (bit7..bit0)
         self._bit_decode = _BIT_DECODE
 
         # Color index buffer for vectorized numpy composition
         self._color_buf = [0] * 256
+
+        # CHR data cache (set lazily on first render)
+        self._chr_cached = False
+        self._chr_data = None
+        self._mapper_read_chr = None
 
     # ----------------------------------------------------------------
     # Public API used by NES to advance the PPU
@@ -277,58 +279,48 @@ class PPU:
     # ----------------------------------------------------------------
 
     def _render_scanline(self, y):
-        """Render one scanline into self.screen[y]."""
+        """Render one scanline into self.screen[y].
+        Merged BG + sprite composition eliminates separate compose pass."""
         screen_row = self.screen[y]
-        palette_ram = self.palette_ram
         palette_rgb = self.palette
-        read_chr = self.nes.cartridge.read_chr
 
-        # Copy horizontal scroll bits from t to v at start of each visible scanline
+        # Cache CHR data source once (avoids getattr per scanline)
+        if not self._chr_cached:
+            mapper = self.nes.cartridge.mapper
+            self._chr_data = getattr(mapper, '_chr', None)
+            self._mapper_read_chr = mapper.read_chr
+            self._chr_cached = True
+        chr_data = self._chr_data
+        read_chr = self._mapper_read_chr
+
+        # Copy horizontal scroll bits from t to v
         self.v = (self.v & ~0x041F) | (self.t & 0x041F)
 
-        # -- Background (writes into self._bg_pixels) --
-        bg = self._bg_pixels
-        self._render_bg_scanline(y, read_chr)
-
-        # -- Sprites (writes into self._sp_* buffers, returns sprite0 flag) --
-        sp_pixels = self._sp_pixels
-        sp_prio = self._sp_prio
-        sp_opaque = self._sp_opaque
-        sp0_present = self._render_sprite_scanline(y, read_chr)
-
-        # -- Sprite 0 hit detection (only when sprite 0 is on this scanline) --
-        if sp0_present and not (self.status & 0x40):
-            if (self.mask & 0x18) == 0x18:
-                sp0 = self._sp0_opaque
-                both_left = (self.mask & 0x06) == 0x06
-                start = 0 if both_left else 8
-                for px in range(start, 255):
-                    if sp0[px] and (bg[px] & 3):
-                        self.status |= 0x40
-                        break
-
-        # -- Compose: build palette indices, then vectorized numpy RGB write --
         cbuf = self._color_buf
-        for px in range(256):
-            bg_val = bg[px]
-            if sp_opaque[px]:
-                if (bg_val & 3) and sp_prio[px]:
-                    cbuf[px] = palette_ram[bg_val] & 0x3F
-                else:
-                    cbuf[px] = palette_ram[sp_pixels[px]] & 0x3F
-            else:
-                cbuf[px] = palette_ram[bg_val] & 0x3F
+        bg = self._bg_pixels
+
+        # BG pass writes both cbuf (final NES color) and bg (palette index)
+        self._render_bg_scanline(y, cbuf, bg, read_chr, chr_data)
+
+        # Sprite pass writes directly into cbuf; returns True on sprite 0 hit
+        if self.mask & 0x10:
+            if self._render_sprites_direct(y, cbuf, bg, read_chr, chr_data):
+                self.status |= 0x40
+
+        # Single vectorized RGB write
         screen_row[:] = palette_rgb[cbuf]
 
-        # Y increment at end of visible scanline
         self._y_increment()
 
-    def _render_bg_scanline(self, y, read_chr):
-        """Render background into self._bg_pixels using v register for scroll."""
-        bg = self._bg_pixels
+    def _render_bg_scanline(self, y, cbuf, bg, read_chr, chr_data):
+        """Render BG into cbuf (NES color) and bg (palette index) in one pass."""
+        palette_ram = self.palette_ram
+        bg_color = palette_ram[0] & 0x3F
+
         bg[:] = _ZEROS_256
 
         if not (self.mask & 0x08):
+            cbuf[:] = [bg_color] * 256
             return
 
         # Extract scroll position from v register
@@ -357,8 +349,11 @@ class PPU:
         else:
             nt_bases = (0x400, 0x400, 0x400, 0x400)
 
-        # Pre-compute attribute row offset
         attr_row_off = (coarse_y >> 2) * 8
+        row_base = coarse_y * 32
+
+        # Direct CHR access for Mapper 0 (no method call overhead)
+        use_direct = chr_data is not None
 
         px = 0
         tile_col = coarse_x
@@ -369,10 +364,14 @@ class PPU:
             nt_index = cur_nt_h | (nt_v << 1)
             vram_base = nt_bases[nt_index]
 
-            tile_idx = vram[vram_base + coarse_y * 32 + tile_col]
+            tile_idx = vram[vram_base + row_base + tile_col]
             pat_addr = pattern_table + tile_idx * 16 + fine_y
-            lo = read_chr(pat_addr)
-            hi = read_chr(pat_addr + 8)
+            if use_direct:
+                lo = chr_data[pat_addr & 0x1FFF]
+                hi = chr_data[(pat_addr + 8) & 0x1FFF]
+            else:
+                lo = read_chr(pat_addr)
+                hi = read_chr(pat_addr + 8)
 
             attr = vram[vram_base + 0x3C0 + attr_row_off + (tile_col >> 2)]
             shift = ((coarse_y & 2) << 1) | (tile_col & 2)
@@ -387,10 +386,16 @@ class PPU:
             for i in range(start, 8):
                 if px >= 256:
                     break
-                if not (px < 8 and clip_left):
+                if px < 8 and clip_left:
+                    cbuf[px] = bg_color
+                else:
                     pixel = lo_bits[i] | (hi_bits[i] << 1)
                     if pixel:
-                        bg[px] = pal_base + pixel
+                        idx = pal_base + pixel
+                        bg[px] = idx
+                        cbuf[px] = palette_ram[idx] & 0x3F
+                    else:
+                        cbuf[px] = bg_color
                 px += 1
 
             tile_col += 1
@@ -414,27 +419,22 @@ class PPU:
                 y += 1
             self.v = (self.v & ~0x03E0) | (y << 5)
 
-    def _render_sprite_scanline(self, y, read_chr):
-        """Render sprites into pre-allocated buffers. Returns True if sprite 0 is on this scanline."""
-        pixels = self._sp_pixels
-        prio = self._sp_prio
-        opaque = self._sp_opaque
-        sprite0 = self._sp0_opaque
-
-        # Fast clear via slice assignment (C-level operation)
-        pixels[:] = _ZEROS_256
-        prio[:] = _ZEROS_256
-        opaque[:] = _ZEROS_256
-        sprite0[:] = _ZEROS_256
-
-        if not (self.mask & 0x10):
-            return False
-
-        sprite_size = 16 if (self.ctrl & 0x20) else 8
+    def _render_sprites_direct(self, y, cbuf, bg, read_chr, chr_data):
+        """Render sprites directly into cbuf with integrated sprite 0 hit.
+        Returns True if sprite 0 hit occurred on this scanline."""
         oam = self.oam
+        palette_ram = self.palette_ram
+        sprite_size = 16 if (self.ctrl & 0x20) else 8
         bit_decode = self._bit_decode
+        use_direct = chr_data is not None
+
+        sp_claimed = self._sp_opaque
+        sp_claimed[:] = _ZEROS_256
+
         count = 0
-        sp0_present = False
+        sp0_hit = False
+        check_hit = not (self.status & 0x40) and (self.mask & 0x18) == 0x18
+        left_clip = 0 if (self.mask & 0x06) == 0x06 else 8
 
         for i in range(64):
             base = i << 2
@@ -454,7 +454,7 @@ class PPU:
             flip_h = attr & 0x40
             flip_v = attr & 0x80
             behind_bg = attr & 0x20
-            pal_idx = attr & 3
+            pal_base = 0x10 + (attr & 3) * 4
 
             row = y - sprite_y
             if flip_v:
@@ -471,36 +471,41 @@ class PPU:
                     row -= 8
                 pat_addr = pt + ti * 16 + row
 
-            lo = read_chr(pat_addr)
-            hi = read_chr(pat_addr + 8)
+            if use_direct:
+                lo = chr_data[pat_addr & 0x1FFF]
+                hi = chr_data[(pat_addr + 8) & 0x1FFF]
+            else:
+                lo = read_chr(pat_addr)
+                hi = read_chr(pat_addr + 8)
             lo_bits = bit_decode[lo]
             hi_bits = bit_decode[hi]
-            is_sprite0 = (i == 0)
-            pal_base = 0x10 + pal_idx * 4
+            is_sp0 = (i == 0) and check_hit
 
             for bit in range(8):
                 px_x = sprite_x + bit
                 if px_x >= 256:
                     break
-                if opaque[px_x]:
+                if sp_claimed[px_x]:
                     continue
 
-                # BIT_DECODE index 0=bit7(left), 7=bit0(right)
-                # Normal: screen left-to-right maps to decode index 0-7
-                # Flipped: screen left-to-right maps to decode index 7-0
                 col = bit if not flip_h else (7 - bit)
                 pixel = lo_bits[col] | (hi_bits[col] << 1)
                 if pixel == 0:
                     continue
 
-                pixels[px_x] = pal_base + pixel
-                prio[px_x] = behind_bg
-                opaque[px_x] = 1
-                if is_sprite0:
-                    sprite0[px_x] = 1
-                    sp0_present = True
+                sp_claimed[px_x] = 1
 
-        return sp0_present
+                # Sprite 0 hit: both sprite and BG opaque at same pixel
+                if is_sp0 and (bg[px_x] & 3) and px_x >= left_clip:
+                    sp0_hit = True
+
+                # Priority: behind-BG sprite + opaque BG = BG wins
+                if behind_bg and (bg[px_x] & 3):
+                    continue
+
+                cbuf[px_x] = palette_ram[pal_base + pixel] & 0x3F
+
+        return sp0_hit
 
     def get_frame(self):
         return self.screen
