@@ -99,34 +99,30 @@ class Mapper0:
     def __init__(self, cartridge):
         self.cartridge = cartridge
         self.prg_banks = len(cartridge.prg_rom) // 16384
-    
+        # Pre-compute for fast read (avoids per-read branch + attribute chain)
+        self._prg_rom = cartridge.prg_rom
+        self._prg_mask = 0x3FFF if self.prg_banks == 1 else 0x7FFF
+        # Cache CHR source (avoids len() check per read)
+        self._chr = cartridge.chr_rom if len(cartridge.chr_rom) > 0 else cartridge.chr_ram
+        self._has_chr_ram = len(cartridge.chr_ram) > 0
+
     def read(self, address):
         if address >= 0x8000:
-            # PRG ROM
-            if self.prg_banks == 1:
-                # Mirror for 16KB ROM
-                return self.cartridge.prg_rom[(address - 0x8000) & 0x3FFF]
-            else:
-                # 32KB ROM
-                return self.cartridge.prg_rom[address - 0x8000]
+            return self._prg_rom[(address - 0x8000) & self._prg_mask]
         elif address >= 0x6000:
-            # PRG RAM
             return self.cartridge.prg_ram[address - 0x6000]
         return 0
-    
+
     def write(self, address, value):
         if address >= 0x6000 and address < 0x8000:
             # PRG RAM
             self.cartridge.prg_ram[address - 0x6000] = value
-    
+
     def read_chr(self, address):
-        if len(self.cartridge.chr_rom) > 0:
-            return self.cartridge.chr_rom[address & 0x1FFF]
-        else:
-            return self.cartridge.chr_ram[address & 0x1FFF]
-    
+        return self._chr[address & 0x1FFF]
+
     def write_chr(self, address, value):
-        if len(self.cartridge.chr_ram) > 0:
+        if self._has_chr_ram:
             self.cartridge.chr_ram[address & 0x1FFF] = value
 
 
