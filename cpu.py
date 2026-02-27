@@ -43,41 +43,68 @@ class CPU:
         self.Y = 0
         self.SP = 0xFD
         self.P = 0x24
-        # Read reset vector
-        self.PC = self.read_word(0xFFFC)
         self.cycles = 0
         self.total_cycles = 7  # Reset takes 7 cycles
-    
+
+        # Cache fast-path references (bypass Memory.read indirection)
+        mem = self.memory
+        self._ram = mem.ram
+        self._mem_read = mem.read
+        self._mem_write = mem.write
+        self._cart_read = mem.nes.cartridge.read
+
+        # Read reset vector
+        self.PC = self.read_word(0xFFFC)
+
     def read(self, address):
-        """Read byte from memory"""
-        return self.memory.read(address & 0xFFFF)
-    
+        """Read byte from memory (fast-path for cartridge and RAM)"""
+        address &= 0xFFFF
+        if address >= 0x4020:
+            return self._cart_read(address)
+        if address < 0x2000:
+            return self._ram[address & 0x7FF]
+        return self._mem_read(address)
+
     def write(self, address, value):
-        """Write byte to memory"""
-        self.memory.write(address & 0xFFFF, value & 0xFF)
-    
+        """Write byte to memory (fast-path for RAM)"""
+        address &= 0xFFFF
+        if address < 0x2000:
+            self._ram[address & 0x7FF] = value & 0xFF
+        else:
+            self._mem_write(address, value & 0xFF)
+
     def read_word(self, address):
-        """Read 16-bit word (little-endian)"""
-        lo = self.read(address)
-        hi = self.read(address + 1)
-        return (hi << 8) | lo
-    
+        """Read 16-bit word (little-endian, fast-path)"""
+        address &= 0xFFFF
+        if address >= 0x4020:
+            cr = self._cart_read
+            return cr(address) | (cr(address + 1) << 8)
+        if address < 0x1FFF:
+            ram = self._ram
+            return ram[address & 0x7FF] | (ram[(address + 1) & 0x7FF] << 8)
+        r = self._mem_read
+        return r(address) | (r(address + 1) << 8)
+
     def read_word_bug(self, address):
-        """Read word with 6502 page boundary bug"""
-        lo = self.read(address)
-        hi = self.read((address & 0xFF00) | ((address + 1) & 0x00FF))
-        return (hi << 8) | lo
-    
+        """Read word with 6502 page boundary bug (fast-path for RAM)"""
+        if address < 0x2000:
+            ram = self._ram
+            a = address & 0x7FF
+            b = ((address & 0xFF00) | ((address + 1) & 0xFF)) & 0x7FF
+            return ram[a] | (ram[b] << 8)
+        r = self._mem_read
+        return r(address) | (r((address & 0xFF00) | ((address + 1) & 0xFF)) << 8)
+
     # Stack operations
     def push(self, value):
         """Push byte to stack"""
-        self.write(0x0100 + self.SP, value)
+        self._ram[0x0100 + self.SP] = value & 0xFF
         self.SP = (self.SP - 1) & 0xFF
-    
+
     def pull(self):
         """Pull byte from stack"""
         self.SP = (self.SP + 1) & 0xFF
-        return self.read(0x0100 + self.SP)
+        return self._ram[0x0100 + self.SP]
     
     def push_word(self, value):
         """Push word to stack"""
@@ -187,13 +214,19 @@ class CPU:
         """Add with Carry"""
         a = self.A
         b = self.read(addr)
-        c = self.get_flag(self.FLAG_C)
-        result = a + b + c
-        
+        result = a + b + (self.P & 1)
+
         self.A = result & 0xFF
-        self.set_flag(self.FLAG_C, result > 0xFF)
-        self.set_flag(self.FLAG_V, ((a ^ result) & (b ^ result) & 0x80) != 0)
-        self.set_zn(self.A)
+        # Inline carry and overflow flag setting
+        p = self.P & 0x3C  # clear C, Z, V, N
+        if result > 0xFF:
+            p |= 0x01
+        if ((a ^ result) & (b ^ result) & 0x80):
+            p |= 0x40
+        r = self.A
+        if r == 0:
+            p |= 0x02
+        self.P = p | (r & 0x80)
         return page_crossed
     
     def AND(self, addr, page_crossed):
@@ -204,15 +237,21 @@ class CPU:
     
     def ASL_ACC(self, addr, page_crossed):
         """Arithmetic Shift Left (Accumulator)"""
-        self.set_flag(self.FLAG_C, self.A & 0x80)
+        if self.A & 0x80:
+            self.P |= 0x01
+        else:
+            self.P &= 0xFE
         self.A = (self.A << 1) & 0xFF
         self.set_zn(self.A)
         return 0
-    
+
     def ASL(self, addr, page_crossed):
         """Arithmetic Shift Left"""
         value = self.read(addr)
-        self.set_flag(self.FLAG_C, value & 0x80)
+        if value & 0x80:
+            self.P |= 0x01
+        else:
+            self.P &= 0xFE
         value = (value << 1) & 0xFF
         self.write(addr, value)
         self.set_zn(value)
@@ -220,7 +259,7 @@ class CPU:
     
     def BCC(self, addr, page_crossed):
         """Branch if Carry Clear"""
-        if not self.get_flag(self.FLAG_C):
+        if not (self.P & 0x01):
             extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
                 extra += 1
@@ -230,7 +269,7 @@ class CPU:
     
     def BCS(self, addr, page_crossed):
         """Branch if Carry Set"""
-        if self.get_flag(self.FLAG_C):
+        if self.P & 0x01:
             extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
                 extra += 1
@@ -240,7 +279,7 @@ class CPU:
     
     def BEQ(self, addr, page_crossed):
         """Branch if Equal"""
-        if self.get_flag(self.FLAG_Z):
+        if self.P & 0x02:
             extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
                 extra += 1
@@ -251,14 +290,12 @@ class CPU:
     def BIT(self, addr, page_crossed):
         """Bit Test"""
         value = self.read(addr)
-        self.set_flag(self.FLAG_V, value & 0x40)
-        self.set_flag(self.FLAG_N, value & 0x80)
-        self.set_flag(self.FLAG_Z, (value & self.A) == 0)
+        self.P = (self.P & 0x3D) | (value & 0xC0) | (0x02 if (value & self.A) == 0 else 0)
         return 0
     
     def BMI(self, addr, page_crossed):
         """Branch if Minus"""
-        if self.get_flag(self.FLAG_N):
+        if self.P & 0x80:
             extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
                 extra += 1
@@ -268,7 +305,7 @@ class CPU:
     
     def BNE(self, addr, page_crossed):
         """Branch if Not Equal"""
-        if not self.get_flag(self.FLAG_Z):
+        if not (self.P & 0x02):
             extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
                 extra += 1
@@ -278,7 +315,7 @@ class CPU:
     
     def BPL(self, addr, page_crossed):
         """Branch if Positive"""
-        if not self.get_flag(self.FLAG_N):
+        if not (self.P & 0x80):
             extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
                 extra += 1
@@ -291,13 +328,13 @@ class CPU:
         self.PC += 1
         self.push_word(self.PC)
         self.push(self.P | self.FLAG_B | self.FLAG_U)
-        self.set_flag(self.FLAG_I, 1)
+        self.P |= 0x04  # Set I flag
         self.PC = self.read_word(0xFFFE)
         return 0
     
     def BVC(self, addr, page_crossed):
         """Branch if Overflow Clear"""
-        if not self.get_flag(self.FLAG_V):
+        if not (self.P & 0x40):
             extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
                 extra += 1
@@ -307,7 +344,7 @@ class CPU:
     
     def BVS(self, addr, page_crossed):
         """Branch if Overflow Set"""
-        if self.get_flag(self.FLAG_V):
+        if self.P & 0x40:
             extra = 1
             if (self.PC & 0xFF00) != (addr & 0xFF00):
                 extra += 1
@@ -317,46 +354,61 @@ class CPU:
     
     def CLC(self, addr, page_crossed):
         """Clear Carry Flag"""
-        self.set_flag(self.FLAG_C, 0)
+        self.P &= 0xFE
         return 0
-    
+
     def CLD(self, addr, page_crossed):
         """Clear Decimal Flag"""
-        self.set_flag(self.FLAG_D, 0)
+        self.P &= 0xF7
         return 0
-    
+
     def CLI(self, addr, page_crossed):
         """Clear Interrupt Disable"""
-        self.set_flag(self.FLAG_I, 0)
+        self.P &= 0xFB
         return 0
-    
+
     def CLV(self, addr, page_crossed):
         """Clear Overflow Flag"""
-        self.set_flag(self.FLAG_V, 0)
+        self.P &= 0xBF
         return 0
     
     def CMP(self, addr, page_crossed):
         """Compare Accumulator"""
         value = self.read(addr)
         result = self.A - value
-        self.set_flag(self.FLAG_C, self.A >= value)
-        self.set_zn(result)
+        p = self.P & 0x7C  # clear C, Z, N
+        if self.A >= value:
+            p |= 0x01
+        result &= 0xFF
+        if result == 0:
+            p |= 0x02
+        self.P = p | (result & 0x80)
         return page_crossed
-    
+
     def CPX(self, addr, page_crossed):
         """Compare X Register"""
         value = self.read(addr)
         result = self.X - value
-        self.set_flag(self.FLAG_C, self.X >= value)
-        self.set_zn(result)
+        p = self.P & 0x7C
+        if self.X >= value:
+            p |= 0x01
+        result &= 0xFF
+        if result == 0:
+            p |= 0x02
+        self.P = p | (result & 0x80)
         return 0
-    
+
     def CPY(self, addr, page_crossed):
         """Compare Y Register"""
         value = self.read(addr)
         result = self.Y - value
-        self.set_flag(self.FLAG_C, self.Y >= value)
-        self.set_zn(result)
+        p = self.P & 0x7C
+        if self.Y >= value:
+            p |= 0x01
+        result &= 0xFF
+        if result == 0:
+            p |= 0x02
+        self.P = p | (result & 0x80)
         return 0
     
     def DEC(self, addr, page_crossed):
@@ -434,18 +486,20 @@ class CPU:
     
     def LSR_ACC(self, addr, page_crossed):
         """Logical Shift Right (Accumulator)"""
-        self.set_flag(self.FLAG_C, self.A & 0x01)
-        self.A >>= 1
-        self.set_zn(self.A)
+        a = self.A
+        self.P = (self.P & 0xFE) | (a & 0x01)  # Set C from bit 0
+        a >>= 1
+        self.A = a
+        self.P = (self.P & 0x7D) | (0x02 if a == 0 else 0)  # Z,N (N always 0)
         return 0
-    
+
     def LSR(self, addr, page_crossed):
         """Logical Shift Right"""
         value = self.read(addr)
-        self.set_flag(self.FLAG_C, value & 0x01)
+        self.P = (self.P & 0xFE) | (value & 0x01)  # Set C from bit 0
         value >>= 1
         self.write(addr, value)
-        self.set_zn(value)
+        self.P = (self.P & 0x7D) | (0x02 if value == 0 else 0)  # Z,N (N always 0)
         return 0
     
     def NOP(self, addr, page_crossed):
@@ -481,17 +535,23 @@ class CPU:
     
     def ROL_ACC(self, addr, page_crossed):
         """Rotate Left (Accumulator)"""
-        carry = self.get_flag(self.FLAG_C)
-        self.set_flag(self.FLAG_C, self.A & 0x80)
+        carry = self.P & 1
+        if self.A & 0x80:
+            self.P |= 0x01
+        else:
+            self.P &= 0xFE
         self.A = ((self.A << 1) | carry) & 0xFF
         self.set_zn(self.A)
         return 0
-    
+
     def ROL(self, addr, page_crossed):
         """Rotate Left"""
         value = self.read(addr)
-        carry = self.get_flag(self.FLAG_C)
-        self.set_flag(self.FLAG_C, value & 0x80)
+        carry = self.P & 1
+        if value & 0x80:
+            self.P |= 0x01
+        else:
+            self.P &= 0xFE
         value = ((value << 1) | carry) & 0xFF
         self.write(addr, value)
         self.set_zn(value)
@@ -499,17 +559,23 @@ class CPU:
     
     def ROR_ACC(self, addr, page_crossed):
         """Rotate Right (Accumulator)"""
-        carry = self.get_flag(self.FLAG_C)
-        self.set_flag(self.FLAG_C, self.A & 0x01)
+        carry = self.P & 1
+        if self.A & 0x01:
+            self.P |= 0x01
+        else:
+            self.P &= 0xFE
         self.A = (self.A >> 1) | (carry << 7)
         self.set_zn(self.A)
         return 0
-    
+
     def ROR(self, addr, page_crossed):
         """Rotate Right"""
         value = self.read(addr)
-        carry = self.get_flag(self.FLAG_C)
-        self.set_flag(self.FLAG_C, value & 0x01)
+        carry = self.P & 1
+        if value & 0x01:
+            self.P |= 0x01
+        else:
+            self.P &= 0xFE
         value = (value >> 1) | (carry << 7)
         self.write(addr, value)
         self.set_zn(value)
@@ -530,28 +596,33 @@ class CPU:
         """Subtract with Carry"""
         a = self.A
         b = self.read(addr)
-        c = self.get_flag(self.FLAG_C)
-        result = a - b - (1 - c)
-        
+        result = a - b - (1 - (self.P & 1))
+
         self.A = result & 0xFF
-        self.set_flag(self.FLAG_C, result >= 0)
-        self.set_flag(self.FLAG_V, ((a ^ b) & (a ^ result) & 0x80) != 0)
-        self.set_zn(self.A)
+        p = self.P & 0x3C
+        if result >= 0:
+            p |= 0x01
+        if ((a ^ b) & (a ^ result) & 0x80):
+            p |= 0x40
+        r = self.A
+        if r == 0:
+            p |= 0x02
+        self.P = p | (r & 0x80)
         return page_crossed
     
     def SEC(self, addr, page_crossed):
         """Set Carry Flag"""
-        self.set_flag(self.FLAG_C, 1)
+        self.P |= 0x01
         return 0
-    
+
     def SED(self, addr, page_crossed):
         """Set Decimal Flag"""
-        self.set_flag(self.FLAG_D, 1)
+        self.P |= 0x08
         return 0
-    
+
     def SEI(self, addr, page_crossed):
         """Set Interrupt Disable"""
-        self.set_flag(self.FLAG_I, 1)
+        self.P |= 0x04
         return 0
     
     def STA(self, addr, page_crossed):
@@ -623,7 +694,10 @@ class CPU:
         value = (self.read(addr) - 1) & 0xFF
         self.write(addr, value)
         result = self.A - value
-        self.set_flag(self.FLAG_C, self.A >= value)
+        if self.A >= value:
+            self.P |= 0x01
+        else:
+            self.P &= 0xFE
         self.set_zn(result)
         return 0
     
@@ -631,64 +705,69 @@ class CPU:
         """Increment and Subtract"""
         value = (self.read(addr) + 1) & 0xFF
         self.write(addr, value)
-        # SBC
+        # SBC inlined
         a = self.A
-        b = value
-        c = self.get_flag(self.FLAG_C)
-        result = a - b - (1 - c)
+        result = a - value - (1 - (self.P & 1))
         self.A = result & 0xFF
-        self.set_flag(self.FLAG_C, result >= 0)
-        self.set_flag(self.FLAG_V, ((a ^ b) & (a ^ result) & 0x80) != 0)
-        self.set_zn(self.A)
+        p = self.P & 0x3C
+        if result >= 0: p |= 0x01
+        if ((a ^ value) & (a ^ result) & 0x80): p |= 0x40
+        r = self.A
+        if r == 0: p |= 0x02
+        self.P = p | (r & 0x80)
         return 0
     
     def SLO(self, addr, page_crossed):
         """Shift Left and OR"""
         value = self.read(addr)
-        self.set_flag(self.FLAG_C, value & 0x80)
+        self.P = (self.P & 0xFE) | ((value >> 7) & 1)  # C from bit 7
         value = (value << 1) & 0xFF
         self.write(addr, value)
         self.A |= value
-        self.set_zn(self.A)
+        r = self.A
+        self.P = (self.P & 0x7D) | (0x02 if r == 0 else 0) | (r & 0x80)
         return 0
     
     def RLA(self, addr, page_crossed):
         """Rotate Left and AND"""
         value = self.read(addr)
-        carry = self.get_flag(self.FLAG_C)
-        self.set_flag(self.FLAG_C, value & 0x80)
+        carry = self.P & 1
+        self.P = (self.P & 0xFE) | ((value >> 7) & 1)  # C from bit 7
         value = ((value << 1) | carry) & 0xFF
         self.write(addr, value)
         self.A &= value
-        self.set_zn(self.A)
+        r = self.A
+        self.P = (self.P & 0x7D) | (0x02 if r == 0 else 0) | (r & 0x80)
         return 0
     
     def SRE(self, addr, page_crossed):
         """Shift Right and EOR"""
         value = self.read(addr)
-        self.set_flag(self.FLAG_C, value & 0x01)
+        self.P = (self.P & 0xFE) | (value & 0x01)  # C from bit 0
         value >>= 1
         self.write(addr, value)
         self.A ^= value
-        self.set_zn(self.A)
+        r = self.A
+        self.P = (self.P & 0x7D) | (0x02 if r == 0 else 0) | (r & 0x80)
         return 0
     
     def RRA(self, addr, page_crossed):
         """Rotate Right and Add"""
         value = self.read(addr)
-        carry = self.get_flag(self.FLAG_C)
-        self.set_flag(self.FLAG_C, value & 0x01)
-        value = (value >> 1) | (carry << 7)
+        old_carry = self.P & 1
+        new_carry = value & 0x01
+        value = (value >> 1) | (old_carry << 7)
         self.write(addr, value)
-        # ADC
+        # ADC inlined
         a = self.A
-        b = value
-        c = self.get_flag(self.FLAG_C)
-        result = a + b + c
+        result = a + value + new_carry
         self.A = result & 0xFF
-        self.set_flag(self.FLAG_C, result > 0xFF)
-        self.set_flag(self.FLAG_V, ((a ^ result) & (b ^ result) & 0x80) != 0)
-        self.set_zn(self.A)
+        p = self.P & 0x3C
+        if result > 0xFF: p |= 0x01
+        if ((a ^ result) & (value ^ result) & 0x80): p |= 0x40
+        r = self.A
+        if r == 0: p |= 0x02
+        self.P = p | (r & 0x80)
         return 0
     
     def init_opcodes(self):
@@ -1007,8 +1086,15 @@ class CPU:
             self.irq()
             self.irq_pending = False
 
-        opcode = self.memory.read(self.PC)
-        self.PC = (self.PC + 1) & 0xFFFF
+        # Inline instruction fetch — bypass Memory.read() for the common case
+        pc = self.PC
+        if pc >= 0x4020:
+            opcode = self._cart_read(pc)
+        elif pc < 0x2000:
+            opcode = self._ram[pc & 0x7FF]
+        else:
+            opcode = self._mem_read(pc)
+        self.PC = (pc + 1) & 0xFFFF
 
         entry = self.opcodes[opcode]
         if entry is None:
@@ -1029,15 +1115,15 @@ class CPU:
         """Non-Maskable Interrupt"""
         self.push_word(self.PC)
         self.push(self.P & ~self.FLAG_B | self.FLAG_U)
-        self.set_flag(self.FLAG_I, 1)
+        self.P |= 0x04  # Set I flag
         self.PC = self.read_word(0xFFFA)
         self.cycles = 7
-    
+
     def irq(self):
         """Interrupt Request"""
         self.push_word(self.PC)
         self.push(self.P & ~self.FLAG_B | self.FLAG_U)
-        self.set_flag(self.FLAG_I, 1)
+        self.P |= 0x04  # Set I flag
         self.PC = self.read_word(0xFFFE)
         self.cycles = 7
     
