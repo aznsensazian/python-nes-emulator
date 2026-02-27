@@ -52,25 +52,59 @@ class NES:
         return cycles
 
     def step_frame(self):
-        """Run until a full frame is rendered (optimized with locals)."""
-        # Use local variables for hot loop attributes
+        """Run until a full frame is rendered.
+        Inlines the CPU step() hot loop to avoid ~9K method calls/frame."""
         cpu = self.cpu
         ppu = self.ppu
         apu = self.apu
         ppu_cycles = self._ppu_cycles
-        cpu_step = cpu.step
         ppu_run = ppu.run_scanline
         apu_clock = apu.clock
-        trigger_nmi = cpu.trigger_nmi
+
+        # Cache CPU internals as locals
+        opcodes = cpu.opcodes
+        ram = cpu._ram
+        cart_read = cpu._cart_read
+        mem_read = cpu._mem_read
+        mem_write = cpu._mem_write
 
         ppu.frame_ready = False
         while not ppu.frame_ready:
-            cycles = cpu_step()
+            # --- Inlined cpu.step() ---
+            if cpu.nmi_pending:
+                cpu.nmi()
+                cpu.nmi_pending = False
+            elif cpu.irq_pending and not (cpu.P & 0x04):
+                cpu.irq()
+                cpu.irq_pending = False
+
+            # Fetch opcode
+            pc = cpu.PC
+            if pc >= 0x4020:
+                opcode = cart_read(pc)
+            elif pc < 0x2000:
+                opcode = ram[pc & 0x7FF]
+            else:
+                opcode = mem_read(pc)
+            cpu.PC = (pc + 1) & 0xFFFF
+
+            entry = opcodes[opcode]
+            if entry is None:
+                cycles = 2
+            else:
+                instruction, addr_mode, base_cycles = entry
+                addr, page_crossed = addr_mode()
+                cycles = base_cycles + instruction(addr, page_crossed)
+
+            cpu.cycles = cycles
+            cpu.total_cycles += cycles
+            # --- End inlined cpu.step() ---
+
             ppu_cycles += cycles * 3
             while ppu_cycles >= 341:
                 ppu_cycles -= 341
                 if ppu_run():
-                    trigger_nmi()
+                    cpu.nmi_pending = True
             apu_clock(cycles)
 
         self._ppu_cycles = ppu_cycles

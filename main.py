@@ -124,6 +124,8 @@ class Emulator:
 
         # NES output surface
         self.nes_surface = pygame.Surface((256, 240))
+        # Pre-allocated buffer for transposed frame (avoids per-frame allocation)
+        self._display_buf = np.empty((256, 240, 3), dtype=np.uint8)
 
         # Audio
         self.audio = AudioStreamer()
@@ -157,9 +159,9 @@ class Emulator:
 
     def render(self):
         frame = self.nes.get_frame()
-        # Transpose from (row, col, rgb) to pygame's (col, row, rgb)
-        pygame.surfarray.blit_array(self.nes_surface,
-                                    np.transpose(frame, (1, 0, 2)))
+        # Transpose into pre-allocated buffer (avoids per-frame allocation)
+        np.copyto(self._display_buf, frame.transpose(1, 0, 2))
+        pygame.surfarray.blit_array(self.nes_surface, self._display_buf)
         pygame.transform.scale(self.nes_surface,
                                (self.width, self.height), self.screen)
 
