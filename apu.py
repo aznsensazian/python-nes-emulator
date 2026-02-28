@@ -298,12 +298,12 @@ class APU:
             while self.sample_accum >= cps:
                 self.sample_accum -= cps
                 raw = _mix()
-                # Low-pass filter (~14 kHz) — removes harsh square wave harmonics
+                # Low-pass filter (~12 kHz) — removes harsh square wave harmonics
                 lpf += lp_a * (raw - lpf)
                 # High-pass filter 1 (~37 Hz) — removes DC offset
                 h1y = h1_a * (h1y + lpf - h1x)
                 h1x = lpf
-                # High-pass filter 2 (~440 Hz) — removes low rumble
+                # High-pass filter 2 (~90 Hz) — removes low rumble
                 h2y = h2_a * (h2y + h1y - h2x)
                 h2x = h1y
                 # Clamp to int16
