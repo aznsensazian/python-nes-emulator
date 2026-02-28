@@ -25,7 +25,7 @@ KEY_MAP = {
 
 # Audio constants
 SAMPLE_RATE = 44100
-AUDIO_CHUNK = 1024  # samples per Sound object
+AUDIO_CHUNK = 512  # samples per Sound object (smaller = more frequent flushing)
 
 
 class AudioStreamer:
@@ -42,10 +42,12 @@ class AudioStreamer:
         self.channel = None
         self.stereo = False
         self._sounds = []  # prevent GC of in-flight Sound objects
+        # Target buffer level for adaptive rate control (~50ms of audio)
+        self._target_pending = SAMPLE_RATE // 20
 
         try:
             pygame.mixer.init(frequency=SAMPLE_RATE, size=-16, channels=1,
-                              buffer=1024)
+                              buffer=2048)
             self.enabled = True
             self.channel = pygame.mixer.Channel(0)
             mixer_info = pygame.mixer.get_init()
@@ -61,8 +63,8 @@ class AudioStreamer:
             return
         self.pending.extend(samples)
 
-        # Cap to ~0.25 s to bound memory and latency
-        max_pending = SAMPLE_RATE // 4
+        # Cap to ~0.5 s to bound memory and latency (larger = fewer discontinuities)
+        max_pending = SAMPLE_RATE // 2
         if len(self.pending) > max_pending:
             self.pending = self.pending[-max_pending:]
 
@@ -86,6 +88,13 @@ class AudioStreamer:
         self.pending = self.pending[self.chunk_size:]
 
         arr = np.array(chunk, dtype=np.int16)
+
+        # Fade-in on fresh playback start to avoid click from silence→audio
+        if start:
+            fade_len = min(32, len(arr))
+            for i in range(fade_len):
+                arr[i] = np.int16(arr[i] * i // fade_len)
+
         if self.stereo:
             arr = np.column_stack((arr, arr))
 
@@ -99,6 +108,26 @@ class AudioStreamer:
         self._sounds.append(sound)
         if len(self._sounds) > 4:
             self._sounds.pop(0)
+
+    def get_rate_adjust(self):
+        """Return a multiplier to nudge APU cycles_per_sample.
+
+        If the pending buffer is too full, speed up consumption (return < 1.0).
+        If too empty, slow it down (return > 1.0).  Clamped to ±5%.
+        """
+        level = len(self.pending)
+        target = self._target_pending
+        if target <= 0:
+            return 1.0
+        # Error: positive means buffer is starving (need more samples)
+        error = (target - level) / target
+        # Proportional control, clamp to ±5%
+        adjust = 1.0 + error * 0.03
+        if adjust > 1.05:
+            return 1.05
+        if adjust < 0.95:
+            return 0.95
+        return adjust
 
     def close(self):
         if self.enabled:
@@ -195,17 +224,21 @@ class Emulator:
         NES_FRAME_TIME = 1.0 / 60.0
         next_frame = time.perf_counter()
         audio = self.audio
-        apu_get = self.nes.apu.get_audio_buffer
+        apu = self.nes.apu
+        apu_get = apu.get_audio_buffer
         step_frame = self.nes.step_frame
+        base_cps = apu.cycles_per_sample
+        rate_counter = 0
 
         while self.running:
             self.handle_input()
 
             now = time.perf_counter()
-            # How many NES frames we owe (at least 1, cap at 3)
+            # How many NES frames we owe (at least 1, cap at 5)
+            # Higher cap ensures enough audio samples at low display FPS
             behind = int((now - next_frame) / NES_FRAME_TIME) + 1
-            if behind > 3:
-                behind = 3
+            if behind > 5:
+                behind = 5
                 next_frame = now  # reset to avoid death spiral
 
             for i in range(behind):
@@ -214,6 +247,12 @@ class Emulator:
 
             # Push ALL generated audio (from all emulated frames)
             audio.push_samples(apu_get())
+
+            # Adaptive sample rate: nudge APU production rate every 8 frames
+            rate_counter += 1
+            if rate_counter >= 8:
+                rate_counter = 0
+                apu.cycles_per_sample = base_cps * audio.get_rate_adjust()
 
             # Render only the last frame
             self.render()

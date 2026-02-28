@@ -8,6 +8,23 @@ import numpy as np
 NES_CPU_FREQ = 1789773  # NTSC CPU frequency
 SAMPLE_RATE = 44100
 
+# ── NES nonlinear mixing lookup tables (from nesdev wiki) ──
+# These match the actual NES DAC curves and prevent the clipping/distortion
+# that linear approximations cause.
+# Scale factor maps 0.0–1.0 float range to int16 range.
+# After high-pass filters remove DC (~0.5), signal swings ±16384.
+_MIX_SCALE = 32767
+
+# pulse_table[n] for n = pulse1 + pulse2 (range 0..30)
+_PULSE_MIX = [0] * 31
+for _n in range(1, 31):
+    _PULSE_MIX[_n] = int(95.52 / (8128.0 / _n + 100.0) * _MIX_SCALE)
+
+# tnd_table[n] for n = 3*triangle + 2*noise + dmc (range 0..202)
+_TND_MIX = [0] * 203
+for _n in range(1, 203):
+    _TND_MIX[_n] = int(163.67 / (24329.0 / _n + 100.0) * _MIX_SCALE)
+
 
 class APU:
     def __init__(self, nes):
@@ -42,15 +59,15 @@ class APU:
         self.audio_buffer = []
 
         # Audio filters (matches NES hardware filtering)
-        # Low-pass ~14 kHz: alpha = dt / (RC + dt), RC = 1/(2*pi*14000)
-        self._lpf_alpha = 0.666
+        # Low-pass ~12 kHz: gentler rolloff preserves more musical content
+        self._lpf_alpha = 0.631
         self._lpf_prev = 0.0
-        # High-pass ~37 Hz: removes DC offset, alpha = RC / (RC + dt)
+        # High-pass ~37 Hz: removes DC offset
         self._hpf1_alpha = 0.9947
         self._hpf1_prev_x = 0.0
         self._hpf1_prev_y = 0.0
-        # High-pass ~440 Hz: removes low rumble
-        self._hpf2_alpha = 0.9405
+        # High-pass ~90 Hz: removes low rumble without thinning bass
+        self._hpf2_alpha = 0.9873
         self._hpf2_prev_x = 0.0
         self._hpf2_prev_y = 0.0
 
@@ -302,7 +319,7 @@ class APU:
             self._hpf2_prev_y = h2y
 
     def _mix(self):
-        """Mix all channels into a single int16 sample (inlined outputs)."""
+        """Mix all channels using NES nonlinear lookup tables."""
         # Pulse 1 — inline output()
         p1 = self.pulse1
         if (p1.enabled and p1.length_counter > 0
@@ -341,14 +358,8 @@ class APU:
         # DMC — direct access
         d = self.dmc.output_level
 
-        # Pre-computed constants: coeff * 25000
-        # 0.00752*25000=188, 0.00851*25000=212.75, 0.00494*25000=123.5, 0.00335*25000=83.75
-        val = int(188.0 * (v1 + v2) + 212.75 * t + 123.5 * nv + 83.75 * d)
-        if val > 32767:
-            return 32767
-        if val < -32768:
-            return -32768
-        return val
+        # NES nonlinear mixing (hardware-accurate, no clipping possible)
+        return _PULSE_MIX[v1 + v2] + _TND_MIX[3 * t + 2 * nv + d]
 
     def get_audio_buffer(self):
         """Return accumulated audio samples and clear the buffer."""
