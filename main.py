@@ -63,10 +63,12 @@ class AudioStreamer:
             return
         self.pending.extend(samples)
 
-        # Cap to ~0.5 s to bound memory and latency (larger = fewer discontinuities)
-        max_pending = SAMPLE_RATE // 2
+        # Safety cap at 1 second. With correct adaptive rate, pending should
+        # stay near target (~2200 samples). This only fires during extreme lag.
+        max_pending = SAMPLE_RATE
         if len(self.pending) > max_pending:
-            self.pending = self.pending[-max_pending:]
+            # Keep the front (about to play) to preserve continuity
+            self.pending = self.pending[:max_pending]
 
         self._try_flush()
 
@@ -119,10 +121,11 @@ class AudioStreamer:
         target = self._target_pending
         if target <= 0:
             return 1.0
-        # Error: positive means buffer is starving (need more samples)
-        error = (target - level) / target
+        # Positive error = buffer too full → increase cps → produce fewer samples
+        # Negative error = buffer starving → decrease cps → produce more samples
+        error = (level - target) / target
         # Proportional control, clamp to ±5%
-        adjust = 1.0 + error * 0.03
+        adjust = 1.0 + error * 0.05
         if adjust > 1.05:
             return 1.05
         if adjust < 0.95:
@@ -244,9 +247,11 @@ class Emulator:
             for i in range(behind):
                 step_frame()
                 next_frame += NES_FRAME_TIME
-
-            # Push ALL generated audio (from all emulated frames)
-            audio.push_samples(apu_get())
+                # Push audio after EACH NES frame so the mixer gets
+                # refilled every ~12ms instead of once per display frame.
+                # Without this, the mixer runs dry between display frames
+                # causing ~40ms silence gaps → crackling.
+                audio.push_samples(apu_get())
 
             # Adaptive sample rate: nudge APU production rate every 8 frames
             rate_counter += 1
